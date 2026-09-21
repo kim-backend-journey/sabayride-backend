@@ -24,6 +24,10 @@ public class BookingService {
     private static final ZoneId ZONE = ZoneId.of("Asia/Phnom_Penh");
     private static final int MAX_RENTAL_DAYS = 30;
 
+    /** BigDecimal.ZERO has scale 0 and serialises as "0", which breaks the
+     *  contract's money format. Money always carries two decimal places. */
+    private static final BigDecimal MONEY_ZERO = new BigDecimal("0.00");
+
     private final ShopRepository shops;
     private final MotorbikeRepository motorbikes;
     private final BookingRepository bookings;
@@ -220,12 +224,12 @@ public class BookingService {
     }
 
     private BigDecimal deliveryFeeFor(Shop shop, PickupMethod method) {
-        if (method != PickupMethod.DELIVERY) return BigDecimal.ZERO;
+        if (method != PickupMethod.DELIVERY) return MONEY_ZERO;
         if (!shop.isOffersDelivery()) {
             throw ApiException.badRequest("DELIVERY_NOT_OFFERED",
                     "This shop does not deliver.", "pickupMethod");
         }
-        return shop.getDeliveryFee() == null ? BigDecimal.ZERO : shop.getDeliveryFee();
+        return shop.getDeliveryFee() == null ? MONEY_ZERO : shop.getDeliveryFee();
     }
 
     /**
