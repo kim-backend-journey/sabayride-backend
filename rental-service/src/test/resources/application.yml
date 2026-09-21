@@ -1,0 +1,17 @@
+# Test profile. The datasource URL is injected by @DynamicPropertySource from
+# the Testcontainers instance, so nothing here points at a real database.
+spring:
+  flyway:
+    enabled: true
+    schemas: rental
+    default-schema: rental
+    create-schemas: false
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        default_schema: rental
+logging:
+  level:
+    org.flywaydb: WARN
