@@ -4,6 +4,7 @@ import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
+import java.time.Instant;
 import java.time.LocalDate;
 import java.util.Collection;
 import java.util.List;
@@ -20,8 +21,8 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
      *
      * Strictly less-than and greater-than, because end dates are EXCLUSIVE.
      * A booking 05->07 and a booking 07->09 do NOT overlap: the first ends the
-     * morning the second begins. Using <= or >= here would reject perfectly
-     * valid back-to-back rentals and quietly cost the shop money.
+     * morning the second begins. Using <= or >= would reject perfectly valid
+     * back-to-back rentals and quietly cost the shop money.
      *
      * Only BLOCKING statuses count. A cancelled booking occupies nothing.
      */
@@ -36,6 +37,15 @@ public interface BookingRepository extends JpaRepository<Booking, UUID> {
                                @Param("blocking") Collection<BookingStatus> blocking,
                                @Param("startDate") LocalDate startDate,
                                @Param("endDate") LocalDate endDate);
+
+    /** Holds the shop never answered. Matches ix_booking_hold_sweep. */
+    @Query("""
+           SELECT b FROM Booking b
+            WHERE b.status = com.sabayride.rental.booking.BookingStatus.PENDING
+              AND b.holdExpiresAt IS NOT NULL
+              AND b.holdExpiresAt < :now
+           """)
+    List<Booking> findExpiredHolds(@Param("now") Instant now);
 
     List<Booking> findByCustomerIdOrderByCreatedAtDesc(UUID customerId);
 
