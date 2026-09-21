@@ -2,7 +2,7 @@
 
 **You do not need the backend running. You are never blocked by it.**
 
-Everything below works from the API contract alone, which is published here:
+Everything here works from the API contract alone:
 
 ```
 https://raw.githubusercontent.com/kim-backend-journey/sabayride-backend/main/docs/api/sabayride-api-v1.yaml
@@ -13,40 +13,40 @@ stale within days and you end up building against fields that no longer exist.
 
 ---
 
+## Who builds what
+
+| | Platform | Users | Builds |
+|---|---|---|---|
+| **Flutter app** | Android | Customers **and** shops | Search, booking, my bookings · Shop requests, accept, decline |
+| **Web dashboard** | Browser | **Our team only** | Verify shops, suspend, all bookings, customers, metrics |
+
+**Shops use the phone app, not the dashboard.** A shop owner adds bikes,
+answers booking requests and hands over keys from their phone.
+
+**The dashboard is our internal admin tool.** No customer and no shop ever sees
+it.
+
+---
+
+# Part 1 — Setup (both teams)
+
 ## Step 0 — Install Node.js (once)
 
-Everything here uses `npx`, which ships with Node.
+Everything below uses `npx`, which ships with Node.
 
-https://nodejs.org → LTS version → install → **reopen your terminal**.
-
-Check it worked:
+<https://nodejs.org> → LTS version → install → **reopen your terminal**.
 
 ```bash
 node -v      # v20 or higher
-npx -v
 ```
 
----
-
-## Step 1 — Read the contract like documentation
-
-Open <https://editor.swagger.io>, then **File → Import URL**, and paste the
-contract URL.
-
-You get a browsable list of all 87 endpoints with every field, every example and
-every error code. Keep this tab open while you build — it answers most questions
-faster than asking.
-
----
-
-## Step 2 — Start the fake backend
+## Step 1 — Start the fake backend
 
 ```bash
 npx @stoplight/prism-cli mock https://raw.githubusercontent.com/kim-backend-journey/sabayride-backend/main/docs/api/sabayride-api-v1.yaml
 ```
 
-First run downloads Prism (a minute or so). Then it prints every route it is
-serving:
+First run downloads Prism (a minute). Then it prints every route it serves:
 
 ```
 [CLI] …  Prism is listening on http://127.0.0.1:4010
@@ -55,34 +55,30 @@ serving:
 …
 ```
 
-**Read that list.** It shows the exact URLs to call — copy them from there
-rather than guessing.
+**Read that list** — it shows the exact URLs to call. Copy from there rather
+than guessing.
 
-Leave this terminal open. It's your server now.
+This runs on **your** computer. It is not something anyone has to start for you.
+Leave the terminal open; it's your server.
 
----
+## Step 2 — Check it responds
 
-## Step 3 — Check it responds
-
-In a second terminal, or just paste into a browser:
+Paste into a browser:
 
 ```
 http://127.0.0.1:4010/api/v1/motorbikes/search?startDate=2026-10-05&endDate=2026-10-07
 ```
 
-You should get back a Honda Dream from "Angkor Moto Rent" — the example from the
-contract. Same field names, same shapes, same types as the real server.
+You should get a Honda Dream from "Angkor Moto Rent".
 
----
+## Step 3 — Put the base URL in ONE place
 
-## Step 4 — Point your app at it
+You will change this at least three times. Do not scatter it through your code.
 
-### Flutter
-
+**Flutter**
 ```dart
 // lib/config/api_config.dart
 class ApiConfig {
-  // ONE place. You will change this at least three times.
   static const String baseUrl = String.fromEnvironment(
     'API_BASE_URL',
     defaultValue: 'http://127.0.0.1:4010/api/v1',
@@ -90,75 +86,58 @@ class ApiConfig {
 }
 ```
 
-Then switch environments without editing code:
-
-```bash
-flutter run --dart-define=API_BASE_URL=http://10.0.2.2:8082/api/v1
-```
-
-### Dashboard
-
+**Dashboard**
 ```ts
 // src/config.ts
 export const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:4010/api/v1";
 ```
 
+## Step 4 — Read the contract like documentation
+
+<https://editor.swagger.io> → **File → Import URL** → paste the contract URL.
+
+All 87 endpoints, every field, every example, every error code. Keep the tab
+open while you build; it answers most questions faster than asking.
+
+## Step 5 — Postman (optional but recommended)
+
+**Import → Link →** paste the contract URL.
+
+You get a ready-made collection of all 87 requests. Set a `baseUrl` variable:
+
+| Environment | Value |
+|---|---|
+| Mock | `http://127.0.0.1:4010/api/v1` |
+| Real backend | `http://localhost:8082/api/v1` |
+
+One dropdown switches between fake and real.
+
+## Step 6 — Generate a typed client (optional)
+
+Needs Java installed. Skip it if that's a hassle — hand-written models are fine,
+just keep field names exact.
+
 ```bash
-# .env.local
-VITE_API_BASE_URL=http://127.0.0.1:4010/api/v1
-```
-
-**Do not scatter the base URL through your code.** One constant, read from an
-environment variable, with the mock as the default.
-
----
-
-## Step 5 (optional) — Generate a typed client
-
-Saves writing model classes by hand, and they stay correct when the contract
-changes.
-
-**Flutter:**
-```bash
+# Flutter
 npx @openapitools/openapi-generator-cli generate \
   -i https://raw.githubusercontent.com/kim-backend-journey/sabayride-backend/main/docs/api/sabayride-api-v1.yaml \
   -g dart-dio -o lib/api
-```
 
-**Dashboard:**
-```bash
+# Dashboard
 npx @openapitools/openapi-generator-cli generate \
   -i https://raw.githubusercontent.com/kim-backend-journey/sabayride-backend/main/docs/api/sabayride-api-v1.yaml \
   -g typescript-axios -o src/api
 ```
 
-Needs Java installed. If that's a problem, skip it — hand-written models against
-the contract are perfectly fine, just keep the field names exact.
-
 ---
 
-## Switching to the real backend
+# Part 2 — Flutter: what to build
 
-When the backend is running (ask in the group first), change only the base URL:
+These **already work on the real backend**. When you switch over, you get live
+data immediately.
 
-| Where you are running | Base URL |
-|---|---|
-| Dashboard, browser on the same laptop | `http://localhost:8082/api/v1` |
-| Flutter on an **Android emulator** | `http://10.0.2.2:8082/api/v1` |
-| Flutter on a **real phone**, same wifi | `http://<backend-laptop-ip>:8082/api/v1` |
-| Deployed (later) | announced in the group |
-
-**`10.0.2.2` is not a typo.** On an Android emulator, `localhost` means the
-emulator itself, not your computer. `10.0.2.2` is the special alias Android uses
-for the host machine. This costs people an afternoon roughly once per project.
-
----
-
-## Build these screens first (Slice 1)
-
-The backend has these working for real. Everything else is a later slice —
-please don't build payment, handover or admin screens yet.
+### Customer
 
 | Screen | Endpoint |
 |---|---|
@@ -170,13 +149,51 @@ please don't build payment, handover or admin screens yet.
 | Booking summary | `POST /bookings/quote` |
 | Confirm booking | `POST /bookings` |
 | My bookings | `GET /bookings` |
-| Shop: requests | `GET /shops/me/bookings?status=PENDING` |
-| Shop: accept | `POST /shops/me/bookings/{id}/confirm` |
-| Shop: decline | `POST /shops/me/bookings/{id}/reject` |
+
+### Shop
+
+| Screen | Endpoint |
+|---|---|
+| Booking requests | `GET /shops/me/bookings?status=PENDING` |
+| Accept | `POST /shops/me/bookings/{id}/confirm` |
+| Decline | `POST /shops/me/bookings/{id}/reject` |
+
+**Not yet:** payment, handover, return, reviews, Explore. Later slices.
+
+### Two screens worth extra care
+
+**Search results.** `startDate` and `endDate` are **required**. A model with
+nothing free is simply absent from the results — don't expect a row with
+`availableUnits: 0`. Show "No bikes available 5–7 Oct" when `content` is empty.
+
+**Booking confirmation.** This is where `409 NO_UNITS_AVAILABLE` happens — the
+bike was taken while the user was deciding. Don't show a generic error; take
+them back to the date picker with a clear message.
 
 ---
 
-## Four rules
+# Part 3 — Dashboard: what to build
+
+**These are not implemented on the backend yet. That does not block you.** The
+mock returns realistic data for every one of them, so build the full UI now. It
+will work the day the backend catches up.
+
+| Screen | Endpoint |
+|---|---|
+| Shop applications → approve / reject | `GET /admin/shops` · `POST /admin/shops/{id}/verify` |
+| Suspend a shop | `POST /admin/shops/{id}/suspend` |
+| All bookings | `GET /admin/bookings` |
+| Customers + suspend | `GET /admin/customers` · `POST /admin/customers/{id}/suspend` |
+| Platform metrics | `GET /admin/metrics` |
+| Failed payouts + retry | `GET /admin/payouts/failed` · `POST /admin/payouts/{id}/retry` |
+
+**Start with shop verification.** It's the screen that matters most — no shop can
+receive a booking until an admin approves it, so nothing else on the platform
+works without it.
+
+---
+
+# Part 4 — Four rules
 
 ### 1. Money is a **string**, not a number
 
@@ -184,18 +201,16 @@ please don't build payment, handover or admin screens yet.
 { "subtotal": "16.00", "platformFee": "1.60" }
 ```
 
-JSON numbers are floating point and lose cents. `18.00` can come back as
+JSON numbers are floating point and lose cents — `18.00` can come back as
 `18.000000000000004`.
 
 ```dart
-// Flutter — add `decimal` to pubspec.yaml
-final subtotal = Decimal.parse(json['subtotal']);   // ✅
-final subtotal = double.parse(json['subtotal']);    // ❌ never
+Decimal.parse(json['subtotal']);   // ✅  add `decimal` to pubspec.yaml
+double.parse(json['subtotal']);    // ❌  never
 ```
-
 ```ts
-// Dashboard
-const subtotal = new Decimal(data.subtotal);        // decimal.js
+new Decimal(data.subtotal);        // ✅  decimal.js
+Number(data.subtotal);             // ❌
 ```
 
 ### 2. Switch on `error.code`, never `error.message`
@@ -208,21 +223,20 @@ Messages get reworded and translated. Codes are a contract.
 
 ```dart
 switch (error.code) {
-  case 'NO_UNITS_AVAILABLE': showDatePickerAgain(); break;
-  case 'PHONE_NOT_VERIFIED': goToVerifyScreen();    break;
+  case 'NO_UNITS_AVAILABLE': backToDatePicker();  break;
+  case 'PHONE_NOT_VERIFIED': goToVerifyScreen();  break;
   default:                   showMessage(error.message);
 }
 ```
 
-Always have a `default` branch — new codes get added.
+Always keep a `default` — new codes get added.
 
 ### 3. `endDate` is **exclusive**
 
-`startDate: 2026-10-05`, `endDate: 2026-10-07` is a **2-day** rental, returning
+`startDate: 2026-10-05` + `endDate: 2026-10-07` is a **2-day** rental, returning
 on the 7th.
 
-When the user picks "5 Oct to 7 Oct" in a date picker, send exactly that. Don't
-add a day.
+Send exactly what the user picked. Don't add a day.
 
 ### 4. Missing a field? Ask — don't work around it
 
@@ -232,23 +246,67 @@ benefits.
 
 ---
 
-## Things that will confuse you
+# Part 5 — Switching to the real backend
 
-**Prism returns the same example every time.** That's deliberate — predictable
-data is easier to build against. For varied data, add `--dynamic`:
+Change **only** the base URL:
+
+| Where you are running | Base URL |
+|---|---|
+| Dashboard, browser on the same laptop as the backend | `http://localhost:8082/api/v1` |
+| Flutter on an **Android emulator** | `http://10.0.2.2:8082/api/v1` |
+| Flutter on a **real phone**, same wifi | `http://<backend-ip>:8082/api/v1` |
+| Deployed (from ~week 3) | announced in the group |
 
 ```bash
-npx @stoplight/prism-cli mock --dynamic <url>
+flutter run --dart-define=API_BASE_URL=http://10.0.2.2:8082/api/v1
+```
+```bash
+# dashboard .env.local
+VITE_API_BASE_URL=http://localhost:8082/api/v1
 ```
 
+**`10.0.2.2` is not a typo.** On an Android emulator, `localhost` means the
+emulator itself, not your computer. `10.0.2.2` is Android's alias for the host
+machine. This costs people an afternoon roughly once per project.
+
+### Four things that change when you switch
+
+**Screens may look empty.** The mock always returns the same example. The real
+database returns what is actually in it. If search comes back `[]`, that is
+probably correct — ask in the group for test data.
+
+**Real errors appear.** The mock returns 200 for almost everything. The real
+server returns `409` when a bike is gone, `400` on bad dates, `404` on an
+unknown shop. Your error handling gets exercised for the first time. This finds
+bugs you already had.
+
+**Auth becomes real.** The mock ignores tokens. Once identity-service is live,
+protected endpoints need a real JWT and expired tokens need refreshing.
+
+**Data persists.** Book a bike on the mock and nothing happens. Book on the real
+server and that bike is gone until it is cancelled.
+
+**Stay on the mock for daily work even after the real server exists.** It is
+faster, always available, and never depends on someone else's laptop being
+awake. Switch to real when you specifically want to test real behaviour.
+
+---
+
+# Part 6 — Things that will confuse you
+
+**Prism returns the same example every time.** Deliberate — predictable data is
+easier to build against. For varied data: `npx @stoplight/prism-cli mock --dynamic <url>`
+
 **Prism validates your requests.** A missing required field returns a real
-validation error rather than pretending it worked. That's a feature: it catches
+validation error instead of pretending it worked. That is a feature; it catches
 your bugs before the real backend does.
 
-**CORS errors are the backend's problem, not yours.** If the browser console
-says "blocked by CORS policy", say so in the group. Don't waste time on it — you
-can't fix it from the frontend.
+**CORS errors are the backend's problem.** If the browser console says "blocked
+by CORS policy", say so in the group and move on. You cannot fix it from the
+frontend.
 
-**A `401` from the mock is normal** on endpoints that need a token. The mock
-doesn't do real authentication. Build the screen; wire real auth when login
-lands.
+**A `401` from the mock is normal** on endpoints that need a token. The mock does
+not do real authentication. Build the screen; wire auth when login lands.
+
+**`npx` says "command not found"** → Node.js isn't installed, or you didn't
+reopen your terminal after installing it.
