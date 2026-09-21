@@ -119,7 +119,7 @@ CREATE TABLE payout_account (
     shop_id                uuid         NOT NULL UNIQUE REFERENCES shop(id),
     bank                   varchar(20)  NOT NULL,
     account_holder_name    varchar(150) NOT NULL,
-    last4                  char(4)      NOT NULL,
+    last4                  varchar(4)      NOT NULL,
     beneficiary_reference  varchar(255) NOT NULL,
     verified               boolean      NOT NULL DEFAULT false,
     registered_at          timestamptz  NOT NULL DEFAULT now(),
@@ -153,7 +153,7 @@ CREATE TABLE motorbike (
     -- NUMERIC, never FLOAT. Affects FUTURE bookings only; past bookings keep
     -- the snapshot on booking_item.
     price_per_day  numeric(10,2) NOT NULL,
-    currency       char(3)       NOT NULL DEFAULT 'USD',
+    currency       varchar(3)       NOT NULL DEFAULT 'USD',
     -- ACTIVE | MAINTENANCE | INACTIVE.  NO 'BOOKED'.  NO 'RENTED'.
     -- This CHECK is the enforcement of the project's central design rule.
     status         varchar(20)   NOT NULL DEFAULT 'ACTIVE',
@@ -248,7 +248,7 @@ CREATE TABLE booking (
     subtotal               numeric(10,2) NOT NULL,
     delivery_fee           numeric(10,2) NOT NULL DEFAULT 0,
     total                  numeric(10,2) NOT NULL,
-    currency               char(3)       NOT NULL DEFAULT 'USD',
+    currency               varchar(3)       NOT NULL DEFAULT 'USD',
 
     -- SNAPSHOT, e.g. 0.1000. Raising the platform rate later must not rewrite
     -- past bookings.
@@ -449,7 +449,7 @@ CREATE TABLE payment (
     extension_id    uuid          REFERENCES booking_extension(id) ON DELETE SET NULL,
     kind            varchar(20)   NOT NULL DEFAULT 'BOOKING',
     amount          numeric(10,2) NOT NULL,
-    currency        char(3)       NOT NULL DEFAULT 'USD',
+    currency        varchar(3)       NOT NULL DEFAULT 'USD',
     method          varchar(20)   NOT NULL,
     status          varchar(30)   NOT NULL DEFAULT 'PENDING',
     -- UNIQUE: the idempotency anchor for the provider callback, which retries.
@@ -498,7 +498,7 @@ CREATE TABLE payout (
     gross_amount        numeric(10,2) NOT NULL,
     platform_fee        numeric(10,2) NOT NULL,
     amount              numeric(10,2) NOT NULL,
-    currency            char(3)       NOT NULL DEFAULT 'USD',
+    currency            varchar(3)       NOT NULL DEFAULT 'USD',
     status              varchar(20)   NOT NULL DEFAULT 'PENDING',
     attempt_count       smallint      NOT NULL DEFAULT 0,
     failure_reason      text,
