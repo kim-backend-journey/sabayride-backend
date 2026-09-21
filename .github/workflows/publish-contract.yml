@@ -1,0 +1,82 @@
+# .github/workflows/publish-contract.yml
+#
+# Publishes the API contract to a stable URL on every merge to main, as raw YAML
+# and as browsable Swagger UI.
+#
+# The point: the Flutter and dashboard teams never clone the backend and never
+# receive a copy over chat. They point their generator at a URL that is always
+# whatever main says. A stale contract stops being possible rather than merely
+# discouraged.
+#
+# One-time setup: repo Settings -> Pages -> Source: GitHub Actions
+
+name: Publish API contract
+
+on:
+  push:
+    branches: [main]
+    paths: ['docs/api/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Fail BEFORE publishing. A broken contract that reaches the frontend
+      # teams costs two people half a day each; catching it here costs 20s.
+      - name: Validate OpenAPI
+        run: |
+          npm install -g @redocly/cli
+          redocly lint docs/api/sabayride-api-v1.yaml --format=stylish
+
+  publish:
+    needs: validate
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the docs site
+        run: |
+          npm install -g @redocly/cli
+          mkdir -p site/api
+
+          # the raw file the generators consume
+          cp docs/api/sabayride-api-v1.yaml site/api/
+
+          # human-readable reference
+          redocly build-docs docs/api/sabayride-api-v1.yaml -o site/index.html
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4
+
+# After the first successful run:
+#
+#   Docs      https://<org>.github.io/sabayride-backend/
+#   Raw YAML  https://<org>.github.io/sabayride-backend/api/sabayride-api-v1.yaml
+#
+# Which makes the frontend teams' setup a single command, with no clone:
+#
+#   npx @openapitools/openapi-generator-cli generate \
+#     -i https://<org>.github.io/sabayride-backend/api/sabayride-api-v1.yaml \
+#     -g dart-dio -o lib/api
+#
+#   npx @stoplight/prism-cli mock \
+#     https://<org>.github.io/sabayride-backend/api/sabayride-api-v1.yaml

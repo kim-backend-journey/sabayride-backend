@@ -1,0 +1,65 @@
+# identity-service/src/main/resources/application.yml
+#
+# Delete the generated application.properties first.
+
+server:
+  port: ${SERVER_PORT:8081}
+
+spring:
+  application:
+    name: identity-service
+
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5433/sabayride?currentSchema=identity}
+    username: ${SPRING_DATASOURCE_USERNAME:identity_user}
+    password: ${SPRING_DATASOURCE_PASSWORD:devpassword}
+    hikari:
+      maximum-pool-size: 10
+      connection-timeout: 5000
+
+  flyway:
+    enabled: true
+    schemas: identity
+    default-schema: identity
+    locations: classpath:db/migration
+    create-schemas: false
+
+  jpa:
+    hibernate:
+      ddl-auto: validate      # Flyway owns the schema. Never `update`.
+    open-in-view: false
+    properties:
+      hibernate:
+        default_schema: identity
+        jdbc:
+          time_zone: UTC
+
+  jackson:
+    default-property-inclusion: non_null
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+
+logging:
+  level:
+    org.flywaydb: INFO
+
+sabayride:
+  jwt:
+    # Only THIS service holds the private key. Everyone else reads the public
+    # key from /.well-known/jwks.json, so no other service can mint a token.
+    private-key-path: ${JWT_PRIVATE_KEY_PATH:../infra/keys/jwt-private.pem}
+    public-key-path:  ${JWT_PUBLIC_KEY_PATH:../infra/keys/jwt-public.pem}
+    access-token-minutes: 15
+    refresh-token-days: 30
+  otp:
+    # LOG prints the code to the console instead of sending an SMS.
+    # Application startup MUST fail if this is LOG under the prod profile —
+    # a backdoor that only works "when misconfigured" is still a backdoor.
+    delivery: ${SABAYRIDE_OTP_DELIVERY:LOG}
+    expiry-minutes: 5
+    max-attempts: 5
+    rate-limit-per-hour: 3

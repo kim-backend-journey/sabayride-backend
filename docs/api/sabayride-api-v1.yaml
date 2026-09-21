@@ -1,0 +1,4080 @@
+openapi: 3.1.0
+
+info:
+  title: SabayRide API
+  version: "1.0.0"
+  description: |
+    Motorbike rental marketplace for Siem Reap. Multi-vendor (B2B2C, O2O).
+
+    ## Conventions this contract commits to
+
+    1. **Money is a decimal string, never a JSON number.** `"24.00"`, not `24.0`.
+       JSON numbers are IEEE-754 doubles and silently lose cents. Flutter parses
+       these with `Decimal.parse()`, Spring with `BigDecimal`. Currency is always
+       stated next to the amount.
+    2. **Dates are date-only (`YYYY-MM-DD`) for rental periods.** A rental day is
+       a calendar day in Asia/Phnom_Penh, not a 24-hour window. Timestamps for
+       events (created, confirmed) are full RFC 3339 UTC.
+    3. **Availability is never stored and never returned as a stored field.** It
+       is computed per request from the requested date range. There is no
+       `BOOKED` or `RENTED` motorbike status anywhere in this contract.
+    4. **Status changes are explicit action endpoints**, not a PATCH on a
+       `status` field. `POST /bookings/{id}/confirm`, not
+       `PATCH /bookings/{id} {"status":"CONFIRMED"}`. The server owns the state
+       machine; the client names an intent.
+    5. **Plate numbers are never returned to customers.** Only the shop and
+       admin see `plateNumber`.
+    6. **`POST /bookings` requires an `Idempotency-Key` header.** A retry with
+       the same key returns the original booking instead of creating a second
+       one. Mobile networks in Cambodia drop responses; the customer taps twice.
+    7. **Every list response is a `PageEnvelope`.** Every error is an `Error`.
+       No endpoint invents its own shape.
+    8. Base path is `/api/v1`. Breaking changes go to `/api/v2`; this document
+       is never edited in a way that breaks a shipped Flutter build.
+
+    ## Requirement traceability
+    Each operation carries an `x-requirements` list pointing at the FR IDs in
+    SRS v1.3.
+
+  contact:
+    name: Group SU30, SETEC Institute
+  license:
+    name: Academic use
+
+servers:
+  - url: http://localhost:8080/api/v1
+    description: Local development
+  - url: https://api.sabayride.com/api/v1
+    description: Production (not yet deployed)
+
+tags:
+  - name: Auth
+    description: Registration, login, token refresh.
+  - name: Discovery
+    description: Public search and browse. No authentication required.
+  - name: Booking
+    description: Customer booking lifecycle.
+  - name: Payment
+    description: Payment initiation and the provider callback.
+  - name: Shop
+    description: Shop-owner and shop-staff operations. Scoped to the caller's own shop.
+  - name: Assistance
+    description: Roadside assistance requests during an active rental.
+  - name: Review
+    description: Post-rental reviews.
+  - name: Notification
+    description: In-app notification centre. Push delivery is separate and best-effort.
+  - name: Explore
+    description: |
+      Explore Siem Reap — places directory and travel articles. Public, cacheable,
+      unrelated to bookings. Later slice.
+  - name: Admin
+    description: Platform administration.
+
+security:
+  - bearerAuth: []
+
+paths:
+
+  # ─────────────────────────────────────────────────────────────────────
+  # AUTH
+  # ─────────────────────────────────────────────────────────────────────
+
+  /auth/register:
+    post:
+      tags: [Auth]
+      summary: Register a customer account
+      description: |
+        Creates a CUSTOMER account. Shop accounts are not created here — a shop
+        owner registers as a customer first, then applies with
+        `POST /shops/applications`. One person can hold both roles.
+      operationId: register
+      security: []
+      x-requirements: [FR-01, FR-02]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+      responses:
+        '201':
+          description: Account created. Verification code sent to the phone.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthTokens'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409':
+          description: Phone or email already registered.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                code: PHONE_ALREADY_REGISTERED
+                message: That phone number already has an account.
+                field: phone
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Log in
+      operationId: login
+      security: []
+      x-requirements: [FR-03]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [identifier, password]
+              properties:
+                identifier:
+                  type: string
+                  description: Phone number or email.
+                  examples: ["+85512345678"]
+                password:
+                  type: string
+                  format: password
+      responses:
+        '200':
+          description: Logged in.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthTokens' }
+        '401':
+          description: |
+            Wrong credentials. The message does not say whether it was the
+            identifier or the password that was wrong — that would let an
+            attacker enumerate registered phone numbers.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                code: INVALID_CREDENTIALS
+                message: Phone number or password is incorrect.
+
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Exchange a refresh token for a new access token
+      operationId: refreshToken
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties:
+                refreshToken: { type: string }
+      responses:
+        '200':
+          description: New token pair.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthTokens' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /auth/verify-phone:
+    post:
+      tags: [Auth]
+      summary: Confirm the phone verification code
+      operationId: verifyPhone
+      x-requirements: [FR-04]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code:
+                  type: string
+                  pattern: '^[0-9]{6}$'
+      responses:
+        '204': { description: Phone verified. }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /auth/otp/resend:
+    post:
+      tags: [Auth]
+      summary: Resend a verification or reset code
+      description: |
+        Invalidates any outstanding code for that phone and issues a new one.
+        Never reuse the old code — two live codes double the guessing surface
+        for no benefit.
+
+        Rate limited hard: 3 per hour, 10 per day, per phone number. An
+        unthrottled resend endpoint is an SMS-pumping vulnerability — an
+        attacker loops it to burn the platform's SMS budget, or to harass a
+        stranger's phone. Attackers scan for these.
+
+        Always answers `202`, even for a phone that has no pending code, so the
+        endpoint cannot be used to test which numbers are registered.
+      operationId: resendOtp
+      security: []
+      x-requirements: [FR-04]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone, purpose]
+              properties:
+                phone: { type: string, examples: ["+85512345678"] }
+                purpose: { type: string, enum: [PHONE_VERIFICATION, PASSWORD_RESET] }
+      responses:
+        '202':
+          description: |
+            Accepted. Says nothing about whether the number exists or whether an
+            SMS was actually sent.
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /auth/password/forgot:
+    post:
+      tags: [Auth]
+      summary: Start a password reset
+      description: |
+        Sends a 6-digit code to the phone number. Step 1 of 3.
+
+        **Always returns `202`, whether or not the number is registered.** A
+        `404` here would turn this endpoint into a phone-number enumerator: an
+        attacker iterates numbers and learns which ones have SabayRide accounts.
+        The response body and the response time must be indistinguishable in
+        both cases — which means doing the same amount of work either way, not
+        just returning the same JSON.
+      operationId: forgotPassword
+      security: []
+      x-requirements: [FR-84]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone]
+              properties:
+                phone: { type: string }
+      responses:
+        '202':
+          description: If that number has an account, a code is on its way.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    examples: ["If that number has an account, we've sent a code."]
+                  expiresInSeconds: { type: integer, examples: [600] }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /auth/password/verify-code:
+    post:
+      tags: [Auth]
+      summary: Exchange the reset code for a short-lived reset token
+      description: |
+        Step 2 of 3. Returns a single-use token, valid 5 minutes, scoped to
+        password reset only — it cannot be used as an access token.
+
+        **Why two steps instead of sending the code and the new password
+        together?** Because the code's validity window would then have to cover
+        the user typing and confirming a new password, and a longer window is
+        more time to brute-force six digits. Splitting it keeps the code's life
+        short and lets the two steps be rate-limited separately. It also lets
+        the UI say "wrong code" before the user has typed a password.
+
+        Max 5 attempts against a code, then it is destroyed and the user must
+        request a new one. Without an attempt cap, six digits is only a million
+        guesses and a script is through in minutes.
+      operationId: verifyPasswordResetCode
+      security: []
+      x-requirements: [FR-84]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone, code]
+              properties:
+                phone: { type: string }
+                code: { type: string, pattern: '^[0-9]{6}$' }
+      responses:
+        '200':
+          description: Code accepted.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [resetToken, expiresIn]
+                properties:
+                  resetToken:
+                    type: string
+                    description: Single-use. Scope `PASSWORD_RESET` only.
+                  expiresIn: { type: integer, examples: [300] }
+        '400':
+          description: |
+            Wrong or expired code. The message does not distinguish the two —
+            "expired" would confirm that a code was issued for that number.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                code: INVALID_RESET_CODE
+                message: That code is not valid. Request a new one.
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /auth/password/reset:
+    post:
+      tags: [Auth]
+      summary: Set a new password using the reset token
+      description: |
+        Step 3 of 3.
+
+        On success the server **revokes every refresh token the user holds**.
+        This is the step most implementations forget, and it is the whole point
+        of a password reset: if an attacker already had a live session, changing
+        the password must end it. A reset that leaves the intruder logged in has
+        achieved nothing.
+
+        The reset token is consumed here — replaying it returns `400`.
+      operationId: resetPassword
+      security: []
+      x-requirements: [FR-84, FR-85]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [resetToken, newPassword]
+              properties:
+                resetToken: { type: string }
+                newPassword:
+                  type: string
+                  format: password
+                  minLength: 8
+                  description: |
+                    Checked against a minimum length and a small denylist of
+                    common passwords. No composition rules (one uppercase, one
+                    symbol) — they push people toward `Password1!` and are worse
+                    than a length floor.
+      responses:
+        '200':
+          description: |
+            Password changed, all other sessions ended, and the user is logged
+            in on this device.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthTokens' }
+        '400':
+          description: Token invalid, expired, already used, or password too weak.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /auth/password/change:
+    post:
+      tags: [Auth]
+      summary: Change password while logged in
+      description: |
+        **`currentPassword` is required even though the caller already holds a
+        valid access token.** A stolen or borrowed token would otherwise be
+        enough to take the account over permanently — the thief sets a new
+        password and the owner is locked out. Requiring the current password
+        means the token alone is not sufficient for an irreversible action.
+
+        As with reset, all other refresh tokens are revoked; the calling device
+        gets a fresh pair.
+      operationId: changePassword
+      x-requirements: [FR-85]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [currentPassword, newPassword]
+              properties:
+                currentPassword: { type: string, format: password }
+                newPassword: { type: string, format: password, minLength: 8 }
+      responses:
+        '200':
+          description: Changed. New token pair for this device.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthTokens' }
+        '401':
+          description: '`currentPassword` is wrong.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /auth/google:
+    post:
+      tags: [Auth]
+      summary: Sign in or sign up with Google
+      description: |
+        The client obtains a Google **ID token** (`google_sign_in` on Flutter)
+        and posts it here. The server verifies it and returns SabayRide's own
+        tokens.
+
+        **The server verifies the ID token itself. It never trusts an email the
+        client sends.** Verification is four checks against Google's published
+        keys (`https://www.googleapis.com/oauth2/v3/certs`):
+
+        1. Signature valid against Google's JWKS.
+        2. `aud` equals this app's OAuth client id — otherwise a token issued
+           for a *different* app would be accepted here.
+        3. `iss` is `accounts.google.com` or `https://accounts.google.com`.
+        4. `exp` in the future.
+
+        An endpoint that accepts `{ "email": "..." }` and logs the caller in is
+        the same thing as no authentication at all. The ID token is the proof;
+        the email inside it is only trustworthy because the signature is.
+
+        **Account resolution**, in order:
+
+        | Situation | Result |
+        |---|---|
+        | Google `sub` already linked | Log in |
+        | No link, but an account exists with that email **verified** | Link and log in |
+        | No link, an account exists with that email **unverified** | `409 EMAIL_REQUIRES_PASSWORD_LOGIN` |
+        | No account at all | Create one, `emailVerified: true`, no password |
+
+        Row 3 is the security-critical one. Google's ID token carries
+        `email_verified`, so the incoming side is trustworthy — but the *existing*
+        account's email may be an address the user simply typed at registration
+        and never proved. Auto-linking on an unverified email enables a
+        **pre-hijacking attack**: an attacker registers an account using the
+        victim's Gmail address and a password of their own, waits, and when the
+        victim later signs in with Google they land inside the attacker's
+        account — where the attacker still knows the password. So an unverified
+        match is refused, and the user must log in with their password first and
+        link from `POST /auth/google/link`.
+
+        **A Google account still cannot book.** Google supplies an identity, not
+        a phone number, and the shop must be able to call the customer at
+        handover. `phoneVerified` stays false until the user adds and verifies a
+        phone, and `POST /bookings` still rejects with `PHONE_NOT_VERIFIED`.
+        Google login removes the password, not the phone.
+      operationId: googleSignIn
+      security: []
+      x-requirements: [FR-86]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [idToken]
+              properties:
+                idToken:
+                  type: string
+                  description: Google ID token (JWT). Not an access token, not an auth code.
+      responses:
+        '200':
+          description: |
+            Signed in. Check `user.phoneVerified` — when false, route the user to
+            the add-phone screen rather than to search.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthTokens' }
+        '401':
+          description: ID token failed verification.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                code: INVALID_GOOGLE_TOKEN
+                message: Could not verify that Google sign-in. Please try again.
+        '409':
+          description: Email belongs to an existing password account with an unverified email.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                code: EMAIL_REQUIRES_PASSWORD_LOGIN
+                message: >-
+                  An account already uses that email. Log in with your password,
+                  then connect Google from your profile.
+
+  /auth/google/link:
+    post:
+      tags: [Auth]
+      summary: Connect Google to the account I am logged into
+      description: |
+        The safe linking path: the caller has already proved who they are with a
+        password, so linking a verified Google identity to their account carries
+        no takeover risk. Fails if that Google account is already attached to
+        someone else.
+      operationId: linkGoogle
+      x-requirements: [FR-86]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [idToken]
+              properties:
+                idToken: { type: string }
+      responses:
+        '200':
+          description: Linked.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Me' }
+        '409':
+          description: That Google account is linked to another SabayRide user.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /auth/password/set:
+    post:
+      tags: [Auth]
+      summary: Set a first password on a Google-created account
+      description: |
+        A Google-created account has no password, so `/auth/password/change`
+        cannot work for it — there is no `currentPassword` to supply. This is
+        that account's one-time path to gaining one, and it is why
+        `/auth/password/change` returns `409 NO_PASSWORD_SET` rather than a
+        confusing `401`.
+
+        Requires a verified phone, because the phone becomes the recovery channel
+        the moment a password exists.
+      operationId: setFirstPassword
+      x-requirements: [FR-85, FR-86]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [newPassword]
+              properties:
+                newPassword: { type: string, format: password, minLength: 8 }
+      responses:
+        '200':
+          description: Password set.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthTokens' }
+        '409':
+          description: This account already has a password — use `/auth/password/change`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Log out
+      description: |
+        Revokes the presented refresh token, and unregisters the device's FCM
+        token so the next user of a shared phone does not receive this user's
+        booking notifications.
+      operationId: logout
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                refreshToken: { type: string }
+                fcmToken: { type: string }
+      responses:
+        '204': { description: Logged out. }
+
+  /me:
+    get:
+      tags: [Auth]
+      summary: Current user and roles
+      description: |
+        Flutter calls this on app start to decide which navigation shell to
+        show. `roles` may contain more than one entry.
+      operationId: getMe
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Me' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    patch:
+      tags: [Auth]
+      summary: Update own profile
+      operationId: updateMe
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                fullName: { type: string }
+                email: { type: string, format: email }
+                preferredLanguage: { type: string, enum: [km, en] }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Me' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /me/phone:
+    post:
+      tags: [Auth]
+      summary: Add or change my phone number
+      description: |
+        The endpoint a Google-created account needs in order to become able to
+        book, and the one an existing user needs after changing SIM. Sends a
+        6-digit code to the new number; `POST /auth/verify-phone` confirms it.
+
+        **The old number stays active until the new one is verified.** Swapping
+        first and verifying after would strand a user who mistyped a digit — they
+        would have no working recovery channel and no way to fix it.
+
+        `409` when the number already belongs to another account. This is the
+        collision that offering two login methods creates: the same person signs
+        up with Google on Monday, forgets, and registers with their phone on
+        Friday. Now one human has two accounts, and the phone is the thing that
+        proves it.
+
+        **Do not auto-merge them.** Merging means deciding whose bookings,
+        reviews, payment history and shop membership survive, and getting it
+        wrong is unrecoverable. Refuse, name the problem, and point the user at
+        the safe path: log into the other account and link Google to it from
+        there.
+      operationId: addOrChangePhone
+      x-requirements: [FR-04, FR-86]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone]
+              properties:
+                phone: { type: string, examples: ["+85512345678"] }
+      responses:
+        '202':
+          description: Code sent to the new number.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  expiresInSeconds: { type: integer, examples: [300] }
+        '409':
+          description: That number is already on another account.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                code: PHONE_BELONGS_TO_ANOTHER_ACCOUNT
+                message: >-
+                  That number is already registered. Log in to that account and
+                  connect Google from your profile instead.
+                field: phone
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /me/auth-methods:
+    get:
+      tags: [Auth]
+      summary: My sign-in methods
+      description: Drives the security section of the profile screen.
+      operationId: listAuthMethods
+      x-requirements: [FR-86]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  methods:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        provider: { type: string, enum: [PASSWORD, GOOGLE] }
+                        label:
+                          type: string
+                          description: What to show the user, e.g. the linked Google email.
+                        addedAt: { type: string, format: date-time }
+                  canUnlink:
+                    type: boolean
+                    description: |
+                      False when only one method remains. The client should grey
+                      out the unlink button rather than let the user discover the
+                      `409` the hard way.
+
+  /me/auth-methods/{provider}:
+    delete:
+      tags: [Auth]
+      summary: Remove a sign-in method
+      description: |
+        **Refuses to remove the last remaining method.** A user who unlinks
+        Google from an account that has no password is locked out permanently,
+        with no recovery path that does not involve an admin editing the
+        database by hand. This check is one line and it prevents a class of
+        support problem that has no good resolution.
+      operationId: unlinkAuthMethod
+      x-requirements: [FR-86]
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          schema: { type: string, enum: [PASSWORD, GOOGLE] }
+      responses:
+        '204': { description: Removed. }
+        '409':
+          description: This is the only way into the account.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                code: CANNOT_REMOVE_LAST_AUTH_METHOD
+                message: Set a password first, then you can disconnect Google.
+
+  /me/notifications:
+    get:
+      tags: [Notification]
+      summary: My notifications
+      description: |
+        The in-app notification centre. Push delivery through FCM is separate and
+        best-effort — a phone can be offline, permission can be denied, and
+        Android can drop a notification silently. This list is the durable record,
+        which is why it exists even though push already works.
+
+        Every notification carries `bookingId` where relevant so tapping it can
+        deep-link straight to the booking rather than dumping the user on a home
+        screen.
+      operationId: listNotifications
+      x-requirements: [FR-56, FR-57]
+      parameters:
+        - name: unreadOnly
+          in: query
+          schema: { type: boolean, default: false }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageEnvelope'
+                  - type: object
+                    properties:
+                      content:
+                        type: array
+                        items: { $ref: '#/components/schemas/Notification' }
+                      unreadCount: { type: integer }
+
+  /me/notifications/{notificationId}/read:
+    post:
+      tags: [Notification]
+      summary: Mark one notification read
+      description: Idempotent — marking an already-read notification is a no-op, not an error.
+      operationId: markNotificationRead
+      x-requirements: [FR-57]
+      parameters:
+        - name: notificationId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '204': { description: Marked read. }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /me/notifications/read-all:
+    post:
+      tags: [Notification]
+      summary: Mark everything read
+      description: |
+        Clears the badge in one call. Without it the client would fire one request
+        per notification, which on a slow connection is both slow and likely to
+        leave the badge in a wrong state halfway through.
+      operationId: markAllNotificationsRead
+      x-requirements: [FR-57]
+      responses:
+        '204': { description: All marked read. }
+
+  /me/devices:
+    post:
+      tags: [Auth]
+      summary: Register an FCM token for push notifications
+      description: |
+        Called after the user grants notification permission, and again whenever
+        Firebase rotates the token. Registering the same token twice is a no-op.
+      operationId: registerDevice
+      x-requirements: [FR-56]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [fcmToken, platform]
+              properties:
+                fcmToken: { type: string }
+                platform: { type: string, enum: [ANDROID, IOS] }
+      responses:
+        '204': { description: Registered. }
+
+  # ─────────────────────────────────────────────────────────────────────
+  # DISCOVERY — the search screen
+  # ─────────────────────────────────────────────────────────────────────
+
+  /motorbikes/search:
+    get:
+      tags: [Discovery]
+      summary: Search available motorbikes for a date range
+      description: |
+        **This is the core endpoint of the system.** One call fills the search
+        results screen.
+
+        Results are grouped by `(shopId, model)`, not by physical unit. A shop
+        with five Honda Dreams and two of them booked returns **one** row with
+        `availableUnits: 3`. The customer books a model; the system assigns the
+        unit (see `POST /bookings`).
+
+        `availableUnits` is computed, not stored. For each unit of each model the
+        server excludes any unit that has a booking in `PENDING`, `CONFIRMED` or
+        `ACTIVE` overlapping the requested range, where overlap is:
+
+        ```
+        existing.start_date < :endDate AND existing.end_date > :startDate
+        ```
+
+        Units in `MAINTENANCE` or `INACTIVE` are excluded regardless of dates.
+
+        `startDate` and `endDate` are required. There is no "show me everything"
+        mode — availability is meaningless without a range, and a screen that
+        shows bikes without saying when they are free is the problem this
+        platform exists to fix.
+      operationId: searchMotorbikes
+      security: []
+      x-requirements: [FR-14, FR-15, FR-16, FR-17, FR-18, FR-19]
+      parameters:
+        - name: startDate
+          in: query
+          required: true
+          description: First rental day, inclusive. Asia/Phnom_Penh calendar date.
+          schema: { type: string, format: date }
+          example: "2026-10-05"
+        - name: endDate
+          in: query
+          required: true
+          description: |
+            Return day, exclusive. `startDate=2026-10-05&endDate=2026-10-07`
+            is a two-day rental. Exclusive end removes the off-by-one argument
+            from every overlap calculation in the codebase.
+          schema: { type: string, format: date }
+          example: "2026-10-07"
+        - name: type
+          in: query
+          description: Repeat the parameter to filter on several types.
+          schema:
+            type: array
+            items: { $ref: '#/components/schemas/MotorbikeType' }
+          style: form
+          explode: true
+        - name: minPricePerDay
+          in: query
+          schema: { type: string, pattern: '^[0-9]+(\.[0-9]{1,2})?$' }
+          example: "5.00"
+        - name: maxPricePerDay
+          in: query
+          schema: { type: string, pattern: '^[0-9]+(\.[0-9]{1,2})?$' }
+          example: "15.00"
+        - name: transmission
+          in: query
+          schema: { type: string, enum: [AUTOMATIC, MANUAL, SEMI_AUTOMATIC] }
+        - name: offersDelivery
+          in: query
+          description: Only shops that deliver to the customer.
+          schema: { type: boolean }
+        - name: minShopRating
+          in: query
+          schema: { type: number, minimum: 1, maximum: 5 }
+          example: 4
+        - name: shopId
+          in: query
+          description: Restrict to one shop — used by the shop profile screen.
+          schema: { type: string, format: uuid }
+        - name: sort
+          in: query
+          schema:
+            type: string
+            enum: [PRICE_ASC, PRICE_DESC, RATING_DESC, RELEVANCE]
+            default: RELEVANCE
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: |
+            Matching models. An empty `content` array is a valid, successful
+            answer — it means nothing is free on those dates, which the UI shows
+            as "No bikes available 5–7 Oct. Try different dates."
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageEnvelope'
+                  - type: object
+                    properties:
+                      content:
+                        type: array
+                        items: { $ref: '#/components/schemas/ModelSearchResult' }
+              example:
+                content:
+                  - shopId: "6f1c0b5e-3a2d-4c11-9f8e-0b1a2c3d4e5f"
+                    shopName: "Angkor Moto Rent"
+                    shopRating: 4.6
+                    shopReviewCount: 38
+                    shopVerified: true
+                    model: "Honda Dream 125"
+                    brand: "Honda"
+                    type: "SCOOTER"
+                    transmission: "SEMI_AUTOMATIC"
+                    pricePerDay: "8.00"
+                    currency: "USD"
+                    availableUnits: 3
+                    primaryPhotoUrl: "https://cdn.sabayride.com/m/dream-1.jpg"
+                    offersDelivery: true
+                    deliveryFee: "2.00"
+                    distanceKm: 1.4
+                page: 0
+                size: 20
+                totalElements: 1
+                totalPages: 1
+        '400':
+          description: |
+            Invalid range. Returned when `endDate <= startDate`, when
+            `startDate` is in the past, or when the range exceeds 30 days.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                code: INVALID_DATE_RANGE
+                message: Return date must be after the pickup date.
+                field: endDate
+
+  /motorbikes/models/{shopId}/{model}:
+    get:
+      tags: [Discovery]
+      summary: Model detail for one shop
+      description: |
+        Fills the model detail screen: photo gallery, specification, price
+        breakdown for the selected dates, shop card, rental requirements, recent
+        reviews. The customer arrives here from a search result, so the same
+        dates are passed through and the price is quoted for them.
+
+        Path is `(shopId, model)` rather than a motorbike UUID because the
+        customer is looking at a model offered by a shop, not at one physical
+        bike. A URL containing a unit id would break as soon as that unit went
+        into maintenance.
+      operationId: getModelDetail
+      security: []
+      x-requirements: [FR-20, FR-21, FR-45]
+      parameters:
+        - name: shopId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: model
+          in: path
+          required: true
+          description: URL-encoded model name, exactly as returned by search.
+          schema: { type: string }
+          example: "Honda%20Dream%20125"
+        - name: startDate
+          in: query
+          required: true
+          schema: { type: string, format: date }
+        - name: endDate
+          in: query
+          required: true
+          schema: { type: string, format: date }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ModelDetail' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /shops/{shopId}:
+    get:
+      tags: [Discovery]
+      summary: Public shop profile
+      operationId: getShopProfile
+      security: []
+      x-requirements: [FR-11, FR-12]
+      parameters:
+        - name: shopId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ShopPublic' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /shops/{shopId}/reviews:
+    get:
+      tags: [Review]
+      summary: Reviews for a shop
+      operationId: listShopReviews
+      security: []
+      x-requirements: [FR-49, FR-50]
+      parameters:
+        - name: shopId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageEnvelope'
+                  - type: object
+                    properties:
+                      content:
+                        type: array
+                        items: { $ref: '#/components/schemas/Review' }
+
+  # ─────────────────────────────────────────────────────────────────────
+  # BOOKING
+  # ─────────────────────────────────────────────────────────────────────
+
+  /places:
+    get:
+      tags: [Explore]
+      summary: Explore Siem Reap — places directory
+      description: |
+        Public, unauthenticated, and the **only part of this API that is safely
+        cacheable**. Every other endpoint is per-user or availability-dependent;
+        this content is identical for everyone and changes rarely, so it can carry
+        a long `Cache-Control` and be served from cache. Worth knowing — it is the
+        cheapest performance win in the whole system.
+
+        `category` is an enum, not free text. If shops or admins could type it,
+        you would get "Cafe", "cafe" and "Coffee shop" as three categories and the
+        filter would silently miss results — the same failure mode as inconsistent
+        motorbike model names.
+      operationId: listPlaces
+      security: []
+      x-requirements: [FR-58, FR-59]
+      parameters:
+        - name: category
+          in: query
+          schema:
+            type: array
+            items: { $ref: '#/components/schemas/PlaceCategory' }
+          style: form
+          explode: true
+        - name: q
+          in: query
+          description: Free-text match on name and description.
+          schema: { type: string }
+        - name: nearLatitude
+          in: query
+          description: |
+            With `nearLongitude` and `radiusKm`, restricts to a bounding box around
+            that point. A bounding box, not true geodesic distance — accurate
+            enough within a city and it needs no PostGIS extension. Adding PostGIS
+            for one directory screen is not worth the operational cost.
+          schema: { type: number, format: double }
+        - name: nearLongitude
+          in: query
+          schema: { type: number, format: double }
+        - name: radiusKm
+          in: query
+          schema: { type: number, format: float, default: 10 }
+        - name: sort
+          in: query
+          schema: { type: string, enum: [FEATURED, NAME_ASC, DISTANCE_ASC], default: FEATURED }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageEnvelope'
+                  - type: object
+                    properties:
+                      content:
+                        type: array
+                        items: { $ref: '#/components/schemas/Place' }
+
+  /places/{placeId}:
+    get:
+      tags: [Explore]
+      summary: Place detail
+      operationId: getPlace
+      security: []
+      x-requirements: [FR-59]
+      parameters:
+        - name: placeId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Place' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /blog:
+    get:
+      tags: [Explore]
+      summary: Published articles
+      description: |
+        Travel guides and route suggestions — "Five rides around Siem Reap",
+        "Getting to Banteay Srei by motorbike".
+
+        **Returns only `PUBLISHED` posts.** Drafts are invisible here regardless
+        of who asks. Leaking unfinished content through a public list endpoint is a
+        standard CMS bug and it is embarrassing in a way that is hard to undo.
+      operationId: listBlogPosts
+      security: []
+      x-requirements: [FR-60]
+      parameters:
+        - name: tag
+          in: query
+          schema: { type: string }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageEnvelope'
+                  - type: object
+                    properties:
+                      content:
+                        type: array
+                        items: { $ref: '#/components/schemas/BlogPostSummary' }
+
+  /blog/{slug}:
+    get:
+      tags: [Explore]
+      summary: Read an article
+      description: |
+        Addressed by **slug, not UUID**. `/blog/five-rides-around-siem-reap` is
+        shareable, readable and indexable by search engines;
+        `/blog/7f3a9c2e-...` is none of those. The UUID stays as the internal and
+        admin identifier — the post has two addresses on purpose, each for the
+        audience that needs it.
+
+        Slugs are unique and immutable once published. Changing a slug breaks
+        every link anyone has already shared.
+      operationId: getBlogPost
+      security: []
+      x-requirements: [FR-60]
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema: { type: string }
+          example: five-rides-around-siem-reap
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BlogPost' }
+        '404':
+          description: No published post with that slug. A draft also returns 404.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /bookings/quote:
+    post:
+      tags: [Booking]
+      summary: Price a booking without creating it
+      description: |
+        Fills the booking summary screen. Returns the full price breakdown so
+        the customer sees the total before committing (FR-24).
+
+        A quote reserves nothing. Two customers can hold the same quote. The
+        quote carries `availableUnits` as a courtesy so the UI can warn
+        "only 1 left", but the authoritative check happens inside
+        `POST /bookings`, under a lock. **Never treat a successful quote as a
+        guarantee that the booking will succeed.**
+      operationId: quoteBooking
+      x-requirements: [FR-23, FR-24, FR-28]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BookingRequest' }
+      responses:
+        '200':
+          description: Price breakdown.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Quote' }
+              example:
+                shopId: "6f1c0b5e-3a2d-4c11-9f8e-0b1a2c3d4e5f"
+                shopName: "Angkor Moto Rent"
+                model: "Honda Dream 125"
+                startDate: "2026-10-05"
+                endDate: "2026-10-07"
+                rentalDays: 2
+                pricePerDay: "8.00"
+                subtotal: "16.00"
+                deliveryFee: "2.00"
+                total: "18.00"
+                currency: "USD"
+                platformFee: "1.60"
+                shopPayout: "16.40"
+                availableUnits: 3
+                paymentOptions: [PAY_NOW, PAY_AT_SHOP]
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /bookings:
+    post:
+      tags: [Booking]
+      summary: Create a booking
+      description: |
+        **The concurrency-critical write.** This is the one endpoint whose
+        implementation must be tested under parallel load before anything else
+        in the system is built.
+
+        Server sequence, all inside a single transaction:
+
+        1. Validate the range and the customer's eligibility.
+        2. `SELECT ... FOR UPDATE` over the shop's units of that model
+           (`@Lock(PESSIMISTIC_WRITE)`), ordered deterministically to avoid
+           deadlock between two concurrent requests.
+        3. Re-run the overlap query against the locked rows.
+        4. If no unit is free → roll back, `409 NO_UNITS_AVAILABLE`.
+        5. Otherwise pick one unit, insert the booking in `PENDING` with a hold
+           expiry, insert the booking item with **snapshot** values
+           (`pricePerDay`, `model`, `deliveryFee` copied in, not referenced),
+           commit.
+
+        The lock is why a concrete unit is assigned here rather than at pickup:
+        you cannot lock a model, only rows.
+
+        Hold expiry: 30 minutes for a same-day pickup, 2 hours otherwise. A hold
+        that expires moves the booking to `EXPIRED` and frees the unit — no
+        payment, no shop action needed.
+
+        `Idempotency-Key` is **required**. Store it against the created booking;
+        a second request with the same key returns `200` and the original
+        booking rather than `201` and a duplicate.
+      operationId: createBooking
+      x-requirements: [FR-26, FR-27, FR-29, FR-30, FR-31]
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: |
+            Client-generated UUID v4, one per booking attempt. Reuse it on every
+            retry of the same attempt; generate a new one when the customer
+            starts a new booking.
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BookingRequest' }
+      responses:
+        '201':
+          description: Booking created in `PENDING`, awaiting shop confirmation.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Booking' }
+        '200':
+          description: |
+            Idempotent replay. The `Idempotency-Key` has been seen; this is the
+            booking it created. Flutter treats 200 and 201 identically here.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Booking' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409':
+          description: |
+            Lost the race, or the customer is not allowed to book.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                soldOut:
+                  summary: Another customer took the last unit
+                  value:
+                    code: NO_UNITS_AVAILABLE
+                    message: That bike was just booked by someone else. Please choose another.
+                overlapping:
+                  summary: Customer already has a booking on those dates
+                  value:
+                    code: CUSTOMER_HAS_OVERLAPPING_BOOKING
+                    message: You already have a booking for 5–7 Oct.
+                unverified:
+                  summary: Phone not verified
+                  value:
+                    code: PHONE_NOT_VERIFIED
+                    message: Verify your phone number before booking.
+        '422':
+          description: |
+            Shop cannot accept this booking — not verified, or the range
+            exceeds the shop's maximum advance window.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+    get:
+      tags: [Booking]
+      summary: My bookings
+      description: Fills the customer's "My Bookings" tab.
+      operationId: listMyBookings
+      x-requirements: [FR-34]
+      parameters:
+        - name: status
+          in: query
+          description: Repeat to filter on several statuses. Omit for all.
+          schema:
+            type: array
+            items: { $ref: '#/components/schemas/BookingStatus' }
+          style: form
+          explode: true
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageEnvelope'
+                  - type: object
+                    properties:
+                      content:
+                        type: array
+                        items: { $ref: '#/components/schemas/BookingSummary' }
+
+  /bookings/{bookingId}:
+    get:
+      tags: [Booking]
+      summary: Booking detail
+      description: |
+        Readable by the booking's customer, by staff of the booking's shop, and
+        by admin. Anyone else gets `404` rather than `403` — a `403` would
+        confirm that the id exists.
+      operationId: getBooking
+      x-requirements: [FR-34, FR-35]
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Booking' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /bookings/{bookingId}/cancel:
+    post:
+      tags: [Booking]
+      summary: Customer cancels a booking
+      description: |
+        Allowed from `PENDING` and `CONFIRMED`. Not allowed from `ACTIVE` — the
+        bike is already out; that is a return, not a cancellation.
+
+        Refund follows the shop's cancellation policy, evaluated server-side.
+        The response carries the resulting `refundAmount` so the UI can state it
+        plainly instead of promising a full refund it cannot deliver.
+      operationId: cancelBooking
+      x-requirements: [FR-36, FR-37]
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string, maxLength: 500 }
+      responses:
+        '200':
+          description: Cancelled.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Booking' }
+        '409': { $ref: '#/components/responses/IllegalTransition' }
+
+  /bookings/{bookingId}/extend/quote:
+    post:
+      tags: [Booking]
+      summary: Price an extension without committing
+      description: |
+        Only valid while the booking is `ACTIVE` — the customer has the bike and
+        wants to keep it longer.
+
+        **Extension is the same concurrency problem as booking, with one unit
+        instead of several.** When a booking is created, the server can pick any
+        free unit of the model. When it is extended, there is exactly one
+        candidate: the bike physically in the customer's hands. It cannot be
+        swapped for a different one, so if that unit is already booked by someone
+        else for the extension window, the extension must be refused. There is no
+        fallback.
+
+        The quote reserves nothing, same as `/bookings/quote`.
+      operationId: quoteExtension
+      x-requirements: [FR-32, FR-33]
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [newEndDate]
+              properties:
+                newEndDate:
+                  type: string
+                  format: date
+                  description: Must be after the current `endDate`.
+      responses:
+        '200':
+          description: Extension priced.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExtensionQuote' }
+              example:
+                bookingId: "1b2c3d4e-5f60-4718-8293-a4b5c6d7e8f9"
+                currentEndDate: "2026-10-07"
+                newEndDate: "2026-10-09"
+                extraDays: 2
+                pricePerDay: "8.00"
+                extraAmount: "16.00"
+                currency: "USD"
+                platformFee: "1.60"
+                shopPayout: "14.40"
+                unitAvailable: true
+        '409':
+          description: |
+            The customer's own bike is booked by someone else in that window.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                code: UNIT_NOT_AVAILABLE_FOR_EXTENSION
+                message: >-
+                  This bike is already booked from 8 Oct. Please return it on time
+                  or ask the shop about a different bike.
+
+  /bookings/{bookingId}/extend:
+    post:
+      tags: [Booking]
+      summary: Extend an active rental
+      description: |
+        Locks the assigned unit (`SELECT ... FOR UPDATE`), re-checks that nothing
+        overlaps the new window, then moves `endDate` forward and appends the
+        extra days to the booking.
+
+        **The extra amount is a separate payment**, not an edit of the original.
+        The first payment has already settled and its payout may already have
+        reached the shop; rewriting the original total would make the money that
+        moved no longer match the booking that justified it. So the extension
+        creates its own payment and its own payout, commission applied at the same
+        rate snapshotted on the booking.
+
+        `Idempotency-Key` required, for the same reason as booking creation.
+      operationId: extendBooking
+      x-requirements: [FR-32, FR-33]
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [newEndDate, paymentOption]
+              properties:
+                newEndDate: { type: string, format: date }
+                paymentOption: { $ref: '#/components/schemas/PaymentOption' }
+      responses:
+        '200':
+          description: |
+            Extended. `endDate` updated; a new payment is pending if
+            `paymentOption` was `PAY_NOW`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Booking' }
+        '409':
+          description: Unit unavailable, or booking is not `ACTIVE`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /bookings/{bookingId}/assistance:
+    post:
+      tags: [Assistance]
+      summary: Request roadside assistance
+      description: |
+        Only valid while the booking is `ACTIVE`. Notifies the shop with the
+        customer's shared coordinates and problem description (FR-52).
+
+        Location is supplied by the client per request; the platform does not
+        track the customer continuously.
+      operationId: requestAssistance
+      x-requirements: [FR-51, FR-52, FR-53]
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [problemType, latitude, longitude]
+              properties:
+                problemType:
+                  type: string
+                  enum: [FLAT_TYRE, WONT_START, ACCIDENT, OUT_OF_FUEL, OTHER]
+                description: { type: string, maxLength: 1000 }
+                latitude: { type: number, format: double }
+                longitude: { type: number, format: double }
+      responses:
+        '201':
+          description: Request raised, shop notified.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AssistanceRequest' }
+        '409':
+          description: Booking is not `ACTIVE`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /bookings/{bookingId}/review:
+    post:
+      tags: [Review]
+      summary: Review a completed rental
+      description: |
+        Only the booking's customer, only once, only when the booking is
+        `COMPLETED` (FR-48). Tying reviews to completed bookings is what stops a
+        competitor from spraying one-star reviews across a shop.
+      operationId: createReview
+      x-requirements: [FR-47, FR-48]
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [rating]
+              properties:
+                rating: { type: integer, minimum: 1, maximum: 5 }
+                comment: { type: string, maxLength: 1000 }
+      responses:
+        '201':
+          description: Review posted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Review' }
+        '409':
+          description: Already reviewed, or booking not completed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  # ─────────────────────────────────────────────────────────────────────
+  # PAYMENT
+  # ─────────────────────────────────────────────────────────────────────
+
+  /bookings/{bookingId}/payment:
+    post:
+      tags: [Payment]
+      summary: Start payment for a booking
+      description: |
+        Returns what the client needs to present the KHQR / ABA PayWay screen —
+        a QR payload, a deeplink, and an expiry. The client renders it and then
+        polls `GET /bookings/{id}/payment`.
+
+        **The client never reports success.** Payment becomes `PAID` only when
+        the provider's signed callback arrives at `POST /payments/callback`. A
+        client that says "user paid" is trivially forged.
+      operationId: initiatePayment
+      x-requirements: [FR-61, FR-62, FR-63]
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [method]
+              properties:
+                method:
+                  type: string
+                  enum: [KHQR, ABA_PAY]
+                  description: |
+                    Card is deliberately out of scope for V1. `KHQR` renders a
+                    scannable QR; `ABA_PAY` returns a deeplink into the ABA app.
+      responses:
+        '201':
+          description: Payment intent created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PaymentIntent' }
+              example:
+                paymentId: "9a7b6c5d-4e3f-2a1b-0c9d-8e7f6a5b4c3d"
+                bookingId: "1b2c3d4e-5f60-4718-8293-a4b5c6d7e8f9"
+                status: PENDING
+                amount: "18.00"
+                currency: "USD"
+                method: KHQR
+                qrPayload: "00020101021229...6304A1B2"
+                deeplink: "abamobilebank://payway?tran_id=SR-000128"
+                expiresAt: "2026-09-19T14:05:00Z"
+        '409':
+          description: |
+            Booking is not payable — already paid, expired, cancelled, or the
+            customer chose `PAY_AT_SHOP`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+    get:
+      tags: [Payment]
+      summary: Poll payment status
+      description: |
+        Called every 3 seconds while the payment sheet is open, and once when
+        the app returns to the foreground after the ABA app hands control back.
+        Stop polling on any terminal status.
+      operationId: getPaymentStatus
+      x-requirements: [FR-64]
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PaymentIntent' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /payments/callback:
+    post:
+      tags: [Payment]
+      summary: Provider payment callback (server-to-server)
+      description: |
+        Called by ABA PayWay, not by the app. Not part of the Flutter surface.
+
+        Rules the implementation must honour:
+
+        - **Verify the signature before reading the body.** An unsigned or
+          mis-signed callback is discarded and logged; it is never allowed to
+          change a payment.
+        - **Idempotent.** The provider retries. Processing the same
+          transaction twice must not confirm the booking twice or double-count
+          revenue.
+        - **Trust the provider's amount, not the client's.** If the paid amount
+          does not match the booking total, mark the payment
+          `AMOUNT_MISMATCH` and leave the booking unconfirmed for admin review.
+        - Always answer `200` once the callback has been recorded, even for a
+          duplicate; a non-200 makes the provider retry forever.
+      operationId: paymentCallback
+      security: []
+      x-requirements: [FR-65, NFR-14]
+      parameters:
+        - name: X-Signature
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [transactionId, status, amount, currency]
+              properties:
+                transactionId: { type: string }
+                status: { type: string, enum: [SUCCESS, FAILED, CANCELLED] }
+                amount: { type: string, pattern: '^[0-9]+(\.[0-9]{1,2})?$' }
+                currency: { type: string, enum: [USD, KHR] }
+                paidAt: { type: string, format: date-time }
+      responses:
+        '200': { description: Callback recorded. }
+        '401': { description: Signature verification failed. }
+
+  # ─────────────────────────────────────────────────────────────────────
+  # SHOP
+  # ─────────────────────────────────────────────────────────────────────
+
+  /shops/applications:
+    post:
+      tags: [Shop]
+      summary: Apply to open a shop
+      description: |
+        Creates a shop in `PENDING_VERIFICATION`. The applicant gains no shop
+        capabilities until an admin approves it (FR-07). Until then the shop is
+        invisible in search.
+      operationId: applyForShop
+      x-requirements: [FR-05, FR-06, FR-07]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ShopApplication' }
+      responses:
+        '201':
+          description: Application submitted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ShopAdmin' }
+        '409':
+          description: Caller already owns a shop.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /shops/me:
+    get:
+      tags: [Shop]
+      summary: My shop
+      description: |
+        Every `/shops/me/**` path resolves the shop from the access token. The
+        shop id is never taken from the request, which is what makes horizontal
+        access between shops impossible by construction rather than by a check
+        someone might forget (NFR-12).
+      operationId: getMyShop
+      x-requirements: [FR-08, NFR-12]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ShopAdmin' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    patch:
+      tags: [Shop]
+      summary: Update my shop
+      operationId: updateMyShop
+      x-requirements: [FR-09]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ShopUpdate' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ShopAdmin' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /shops/me/dashboard:
+    get:
+      tags: [Shop]
+      summary: Shop dashboard counters
+      description: |
+        One call for the shop home screen. Deliberately a single endpoint rather
+        than six: the dashboard is the screen a shop opens twenty times a day,
+        often on a weak connection.
+      operationId: getShopDashboard
+      x-requirements: [FR-43, FR-44]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ShopDashboard' }
+              example:
+                pendingRequests: 2
+                todayPickups: 3
+                todayReturns: 1
+                activeRentals: 5
+                unitsTotal: 12
+                unitsFreeToday: 4
+                unitsInMaintenance: 1
+                revenueThisMonth: "486.00"
+                payoutThisMonth: "437.40"
+                platformFeeThisMonth: "48.60"
+                currency: "USD"
+
+  /shops/me/motorbikes:
+    get:
+      tags: [Shop]
+      summary: List my units
+      description: |
+        Returns physical units, each with `plateNumber` — the shop's own view.
+        `todayStatus` is derived from today's bookings and is read-only.
+      operationId: listMyMotorbikes
+      x-requirements: [FR-22]
+      parameters:
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/MotorbikeStatus' }
+        - name: model
+          in: query
+          schema: { type: string }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageEnvelope'
+                  - type: object
+                    properties:
+                      content:
+                        type: array
+                        items: { $ref: '#/components/schemas/MotorbikeAdmin' }
+    post:
+      tags: [Shop]
+      summary: Add a unit
+      description: |
+        One record per physical motorbike. Five Honda Dreams are five POSTs with
+        five plate numbers — they group into one search result automatically.
+      operationId: createMotorbike
+      x-requirements: [FR-10, FR-13]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MotorbikeInput' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MotorbikeAdmin' }
+        '409':
+          description: Plate number already registered to this shop.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /shops/me/motorbikes/{motorbikeId}:
+    patch:
+      tags: [Shop]
+      summary: Update a unit
+      description: |
+        `status` accepts only `ACTIVE`, `MAINTENANCE` and `INACTIVE`. There is no
+        `BOOKED` or `RENTED` value: whether a bike is rented is a fact about its
+        bookings, not a field a human maintains. Sending one returns `400`.
+
+        Moving a unit to `MAINTENANCE` does **not** cancel its existing
+        bookings. The response lists them in `affectedBookings` so the shop can
+        reassign or reject each one deliberately.
+      operationId: updateMotorbike
+      x-requirements: [FR-22]
+      parameters:
+        - $ref: '#/components/parameters/MotorbikeId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MotorbikeUpdate' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MotorbikeAdmin' }
+        '400':
+          description: Invalid status value.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                code: INVALID_MOTORBIKE_STATUS
+                message: >-
+                  Status must be ACTIVE, MAINTENANCE or INACTIVE. Availability is
+                  calculated from bookings and cannot be set directly.
+                field: status
+    delete:
+      tags: [Shop]
+      summary: Retire a unit
+      description: |
+        Soft delete — sets `INACTIVE`. Hard deletion is refused while the unit
+        has any booking history, because a deleted unit would orphan completed
+        bookings and break the shop's own revenue report.
+      operationId: deleteMotorbike
+      x-requirements: [FR-22]
+      parameters:
+        - $ref: '#/components/parameters/MotorbikeId'
+      responses:
+        '204': { description: Retired. }
+        '409':
+          description: Unit has a current or future booking.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /shops/me/motorbikes/{motorbikeId}/photos:
+    post:
+      tags: [Shop]
+      summary: Upload a photo of a unit
+      operationId: uploadMotorbikePhoto
+      x-requirements: [FR-13]
+      parameters:
+        - $ref: '#/components/parameters/MotorbikeId'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: JPEG or PNG, max 5 MB. Server strips EXIF and re-encodes.
+                isPrimary: { type: boolean, default: false }
+      responses:
+        '201':
+          description: Uploaded
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Photo' }
+        '413':
+          description: File too large.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /shops/me/bookings:
+    get:
+      tags: [Shop]
+      summary: Bookings for my shop
+      description: |
+        `?status=PENDING` fills the requests screen — the one a shop must answer
+        within 30 minutes.
+      operationId: listShopBookings
+      x-requirements: [FR-38, FR-39]
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: array
+            items: { $ref: '#/components/schemas/BookingStatus' }
+          style: form
+          explode: true
+        - name: pickupDate
+          in: query
+          description: Bookings starting on this date — the "today's pickups" list.
+          schema: { type: string, format: date }
+        - name: returnDate
+          in: query
+          schema: { type: string, format: date }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageEnvelope'
+                  - type: object
+                    properties:
+                      content:
+                        type: array
+                        items: { $ref: '#/components/schemas/BookingSummary' }
+
+  /shops/me/bookings/{bookingId}/confirm:
+    post:
+      tags: [Shop]
+      summary: Confirm a pending booking
+      description: |
+        `PENDING → CONFIRMED`. Clears the hold expiry, releases the customer's
+        phone number to the shop, and notifies the customer.
+      operationId: confirmBooking
+      x-requirements: [FR-40, FR-25]
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+      responses:
+        '200':
+          description: Confirmed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Booking' }
+        '409':
+          description: |
+            Not `PENDING` any more — the hold expired, or the customer cancelled
+            while the shop was looking at the screen.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                code: BOOKING_ALREADY_EXPIRED
+                message: This request expired before it was confirmed.
+
+  /shops/me/bookings/{bookingId}/reject:
+    post:
+      tags: [Shop]
+      summary: Reject a pending booking
+      description: |
+        `PENDING → REJECTED`. Frees the unit immediately and triggers a full
+        refund if the customer had paid. `reason` is required — an unexplained
+        rejection is the thing that makes a customer stop trusting the platform,
+        and the rejection rate feeds the shop's reliability metric.
+      operationId: rejectBooking
+      x-requirements: [FR-41]
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason:
+                  type: string
+                  enum: [BIKE_UNAVAILABLE, SHOP_CLOSED, CUSTOMER_UNREACHABLE, OTHER]
+                note: { type: string, maxLength: 500 }
+      responses:
+        '200':
+          description: Rejected.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Booking' }
+        '409': { $ref: '#/components/responses/IllegalTransition' }
+
+  /shops/me/bookings/{bookingId}/handover:
+    post:
+      tags: [Shop]
+      summary: Hand the bike over to the customer
+      description: |
+        **The most consequential write in the system.** `CONFIRMED → ACTIVE`,
+        and the moment money moves.
+
+        The endpoint does four things:
+
+        1. Records the condition at handover — odometer, fuel, photos — which is
+           the shop's only defence in a damage dispute.
+        2. Optionally swaps the assigned unit (`actualMotorbikeId`). The
+           auto-assigned bike may not be the one physically in front of the
+           customer. The server re-checks that the substitute is the same model,
+           belongs to this shop, and is free for the range.
+        3. Records cash taken now, for `PAY_AT_SHOP` bookings.
+        4. **Triggers the payout** to the shop's beneficiary account.
+
+        The payout is fired after the state change and **must not be able to
+        fail the request.** The bike is physically in the customer's hands; a
+        gateway timeout cannot un-hand it. On failure the response still returns
+        `200` with `payoutStatus: FAILED`, and a scheduled job retries. This
+        ordering is a deliberate decision, not an oversight — see SRS 9.4.
+      operationId: handoverBooking
+      x-requirements: [FR-42, FR-66, FR-67, FR-68]
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                actualMotorbikeId:
+                  type: string
+                  format: uuid
+                  description: Present only when handing over a different unit.
+                odometerReading: { type: integer, minimum: 0 }
+                fuelLevel: { type: string, enum: [EMPTY, QUARTER, HALF, THREE_QUARTER, FULL] }
+                conditionNote: { type: string, maxLength: 1000 }
+                conditionPhotoIds:
+                  type: array
+                  items: { type: string, format: uuid }
+                  description: Ids from `POST /shops/me/uploads`.
+                cashCollected:
+                  type: string
+                  pattern: '^[0-9]+(\.[0-9]{1,2})?$'
+                  description: Required when the booking is `PAY_AT_SHOP`.
+      responses:
+        '200':
+          description: |
+            Rental active. Check `payoutStatus` — `FAILED` means the handover
+            succeeded and the transfer will be retried, which is not an error
+            the shop needs to act on.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Booking' }
+        '400':
+          description: Substitute unit is a different model, or `cashCollected` missing.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409': { $ref: '#/components/responses/IllegalTransition' }
+
+  /shops/me/bookings/{bookingId}/return:
+    post:
+      tags: [Shop]
+      summary: Accept the bike back
+      description: |
+        `ACTIVE → COMPLETED`. Records the return condition and any late fee or
+        damage charge. Completing the booking is what unlocks the customer's
+        review.
+      operationId: returnBooking
+      x-requirements: [FR-46, FR-47]
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                odometerReading: { type: integer, minimum: 0 }
+                fuelLevel: { type: string, enum: [EMPTY, QUARTER, HALF, THREE_QUARTER, FULL] }
+                conditionNote: { type: string, maxLength: 1000 }
+                conditionPhotoIds:
+                  type: array
+                  items: { type: string, format: uuid }
+                lateFee: { type: string, pattern: '^[0-9]+(\.[0-9]{1,2})?$' }
+                damageFee: { type: string, pattern: '^[0-9]+(\.[0-9]{1,2})?$' }
+                extraChargeNote: { type: string, maxLength: 500 }
+      responses:
+        '200':
+          description: Completed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Booking' }
+        '409': { $ref: '#/components/responses/IllegalTransition' }
+
+  /shops/me/payout-account:
+    get:
+      tags: [Shop]
+      summary: My payout account
+      description: |
+        Returns only the beneficiary reference, bank, holder name and the last
+        four digits. **The full account number is never stored and therefore
+        never returned** (FR-74). The shop needs a personal ABA account, not a
+        merchant account — that is the platform's main draw for a small shop.
+      operationId: getPayoutAccount
+      x-requirements: [FR-73, FR-74]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PayoutAccount' }
+        '404':
+          description: No payout account set up yet.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    put:
+      tags: [Shop]
+      summary: Set my payout account
+      description: |
+        The account number is sent once, forwarded to the provider for
+        beneficiary registration, and discarded. Only the returned reference is
+        persisted.
+      operationId: setPayoutAccount
+      x-requirements: [FR-73, FR-74, NFR-13]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [bank, accountNumber, accountHolderName]
+              properties:
+                bank: { type: string, enum: [ABA, ACLEDA, WING, OTHER] }
+                accountNumber:
+                  type: string
+                  description: Write-only. Never echoed back in any response.
+                  writeOnly: true
+                accountHolderName: { type: string }
+      responses:
+        '200':
+          description: Registered.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PayoutAccount' }
+        '422':
+          description: Provider rejected the beneficiary.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /shops/me/payouts:
+    get:
+      tags: [Shop]
+      summary: My payout history
+      description: |
+        The month-end statement. Nobody sends the shop an invoice and nobody
+        transfers money by hand — each payout already happened at handover. This
+        is the record of what arrived.
+      operationId: listMyPayouts
+      x-requirements: [FR-69, FR-70]
+      parameters:
+        - name: from
+          in: query
+          schema: { type: string, format: date }
+        - name: to
+          in: query
+          schema: { type: string, format: date }
+        - name: status
+          in: query
+          schema: { type: string, enum: [PENDING, SENT, FAILED] }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageEnvelope'
+                  - type: object
+                    properties:
+                      content:
+                        type: array
+                        items: { $ref: '#/components/schemas/Payout' }
+                      summary:
+                        type: object
+                        properties:
+                          grossTotal: { type: string }
+                          platformFeeTotal: { type: string }
+                          netTotal: { type: string }
+                          currency: { type: string }
+
+  /shops/me/staff:
+    get:
+      tags: [Shop]
+      summary: List shop staff
+      operationId: listShopStaff
+      x-requirements: [FR-71]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/StaffMember' }
+    post:
+      tags: [Shop]
+      summary: Invite staff
+      description: |
+        Staff can confirm, reject, hand over and return. Staff cannot change the
+        payout account or remove other staff — the two actions that move money
+        or grant access stay with the owner.
+      operationId: inviteShopStaff
+      x-requirements: [FR-71, FR-72]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phone]
+              properties:
+                phone: { type: string }
+                fullName: { type: string }
+      responses:
+        '201':
+          description: Invited.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StaffMember' }
+
+  /shops/me/reviews:
+    get:
+      tags: [Review]
+      summary: Reviews of my shop
+      description: |
+        `?unrepliedOnly=true` is the working queue. A shop that replies to
+        criticism reads as a shop that cares; an unanswered one-star review is
+        the first thing a customer sees.
+      operationId: listMyShopReviews
+      x-requirements: [FR-49, FR-50]
+      parameters:
+        - name: unrepliedOnly
+          in: query
+          schema: { type: boolean, default: false }
+        - name: maxRating
+          in: query
+          description: e.g. `3` to find the reviews that need attention first.
+          schema: { type: integer, minimum: 1, maximum: 5 }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageEnvelope'
+                  - type: object
+                    properties:
+                      content:
+                        type: array
+                        items: { $ref: '#/components/schemas/Review' }
+                      averageRating: { type: number, format: float }
+
+  /shops/me/reviews/{reviewId}/reply:
+    post:
+      tags: [Review]
+      summary: Reply to a review of my shop
+      description: |
+        One reply per review — a reply is a response, not a conversation, and
+        threading turns a review page into an argument in public.
+
+        The reply can be edited (`PUT`-like behaviour on repeat `POST` is **not**
+        used here; a second `POST` returns `409`). Editing is deliberately absent
+        from V1: allowing silent edits of a reply, after a customer has read it,
+        is how review sections stop being trustworthy.
+      operationId: replyToReview
+      x-requirements: [FR-50]
+      parameters:
+        - name: reviewId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reply]
+              properties:
+                reply: { type: string, minLength: 1, maxLength: 1000 }
+      responses:
+        '200':
+          description: Reply posted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Review' }
+        '409':
+          description: This review already has a reply.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /shops/me/uploads:
+    post:
+      tags: [Shop]
+      summary: Upload a condition photo
+      description: |
+        Upload first, then reference the returned ids in the handover or return
+        body. Splitting the upload out keeps those two writes small and lets the
+        app upload photos while the staff member is still typing the note.
+      operationId: uploadConditionPhoto
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+      responses:
+        '201':
+          description: Uploaded
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Photo' }
+
+  /shops/me/assistance-requests:
+    get:
+      tags: [Assistance]
+      summary: Assistance requests for my shop
+      operationId: listShopAssistanceRequests
+      x-requirements: [FR-53, FR-54]
+      parameters:
+        - name: status
+          in: query
+          schema: { type: string, enum: [OPEN, IN_PROGRESS, RESOLVED] }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageEnvelope'
+                  - type: object
+                    properties:
+                      content:
+                        type: array
+                        items: { $ref: '#/components/schemas/AssistanceRequest' }
+
+  /shops/me/assistance-requests/{requestId}:
+    patch:
+      tags: [Assistance]
+      summary: Update an assistance request
+      operationId: updateAssistanceRequest
+      x-requirements: [FR-54, FR-55]
+      parameters:
+        - name: requestId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                status: { type: string, enum: [IN_PROGRESS, RESOLVED] }
+                resolutionNote: { type: string, maxLength: 1000 }
+                replacementMotorbikeId: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AssistanceRequest' }
+
+  # ─────────────────────────────────────────────────────────────────────
+  # ADMIN
+  # ─────────────────────────────────────────────────────────────────────
+
+  /admin/shops:
+    get:
+      tags: [Admin]
+      summary: List shops
+      operationId: adminListShops
+      x-requirements: [FR-75, FR-76]
+      parameters:
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/ShopStatus' }
+        - name: q
+          in: query
+          description: Free-text match on shop name or owner phone.
+          schema: { type: string }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageEnvelope'
+                  - type: object
+                    properties:
+                      content:
+                        type: array
+                        items: { $ref: '#/components/schemas/ShopAdmin' }
+
+  /admin/shops/{shopId}/verify:
+    post:
+      tags: [Admin]
+      summary: Approve or reject a shop application
+      description: |
+        `PENDING_VERIFICATION → VERIFIED | REJECTED`. Only a `VERIFIED` shop
+        appears in search and can receive bookings (FR-77).
+      operationId: adminVerifyShop
+      x-requirements: [FR-77]
+      parameters:
+        - name: shopId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision]
+              properties:
+                decision: { type: string, enum: [APPROVE, REJECT] }
+                note: { type: string, maxLength: 1000 }
+      responses:
+        '200':
+          description: Decision recorded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ShopAdmin' }
+
+  /admin/shops/{shopId}/suspend:
+    post:
+      tags: [Admin]
+      summary: Suspend a shop
+      description: |
+        Removes the shop from search at once. Existing `CONFIRMED` and `ACTIVE`
+        bookings are deliberately left alone — customers on the road keep their
+        bikes, and suspension is not a way to strand a tourist in Siem Reap.
+      operationId: adminSuspendShop
+      x-requirements: [FR-78]
+      parameters:
+        - name: shopId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string, maxLength: 1000 }
+      responses:
+        '200':
+          description: Suspended.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ShopAdmin' }
+
+  /admin/bookings:
+    get:
+      tags: [Admin]
+      summary: All bookings
+      operationId: adminListBookings
+      x-requirements: [FR-79]
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: array
+            items: { $ref: '#/components/schemas/BookingStatus' }
+          style: form
+          explode: true
+        - name: shopId
+          in: query
+          schema: { type: string, format: uuid }
+        - name: from
+          in: query
+          schema: { type: string, format: date }
+        - name: to
+          in: query
+          schema: { type: string, format: date }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageEnvelope'
+                  - type: object
+                    properties:
+                      content:
+                        type: array
+                        items: { $ref: '#/components/schemas/BookingSummary' }
+
+  /admin/payouts/failed:
+    get:
+      tags: [Admin]
+      summary: Failed payouts needing attention
+      description: |
+        The queue that exists because handover never blocks on a transfer. If
+        this list is empty, no shop is waiting for money.
+      operationId: adminListFailedPayouts
+      x-requirements: [FR-80]
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageEnvelope'
+                  - type: object
+                    properties:
+                      content:
+                        type: array
+                        items: { $ref: '#/components/schemas/Payout' }
+
+  /admin/payouts/{payoutId}/retry:
+    post:
+      tags: [Admin]
+      summary: Retry a failed payout
+      operationId: adminRetryPayout
+      x-requirements: [FR-80]
+      parameters:
+        - name: payoutId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Retry attempted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Payout' }
+
+  /admin/customers:
+    get:
+      tags: [Admin]
+      summary: List customers
+      description: |
+        Returns account and activity fields only — never a password hash, never a
+        payout account number, never an OTP. An admin list is a common place for
+        sensitive fields to leak by accident, because it is written late and
+        reviewed lightly.
+      operationId: adminListCustomers
+      x-requirements: [FR-75]
+      parameters:
+        - name: q
+          in: query
+          description: Match on name, phone or email.
+          schema: { type: string }
+        - name: status
+          in: query
+          schema: { type: string, enum: [ACTIVE, SUSPENDED] }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageEnvelope'
+                  - type: object
+                    properties:
+                      content:
+                        type: array
+                        items: { $ref: '#/components/schemas/CustomerAdmin' }
+
+  /admin/customers/{userId}/suspend:
+    post:
+      tags: [Admin]
+      summary: Suspend or reinstate a customer
+      description: |
+        A suspended customer cannot create new bookings, but keeps `CONFIRMED` and
+        `ACTIVE` ones — the same rule as shop suspension. Cancelling a rental
+        mid-trip would leave someone stranded on a road outside Siem Reap, which
+        is not a proportionate response to a policy violation.
+      operationId: adminSuspendCustomer
+      x-requirements: [FR-75]
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [suspend, reason]
+              properties:
+                suspend: { type: boolean }
+                reason: { type: string, maxLength: 1000 }
+      responses:
+        '200':
+          description: Updated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CustomerAdmin' }
+
+  /admin/bookings/{bookingId}/refund:
+    post:
+      tags: [Admin]
+      summary: Issue a manual refund
+      description: |
+        Refunds normally happen automatically inside cancel and reject. This is
+        the escape hatch for the cases automation cannot resolve: a provider
+        refund that failed, a shop that took cash it should not have, a dispute
+        settled off-platform.
+
+        `amount` is required and may be partial. Every call is written to the
+        audit log with the admin's identity and reason — a manual money movement
+        with no record of who authorised it is the one thing an auditor will
+        always ask about.
+      operationId: adminRefundBooking
+      x-requirements: [FR-80, NFR-15]
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount, reason]
+              properties:
+                amount: { $ref: '#/components/schemas/Money' }
+                reason: { type: string, minLength: 1, maxLength: 1000 }
+      responses:
+        '200':
+          description: Refund issued.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Booking' }
+        '400':
+          description: Amount exceeds what was actually paid.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: Provider refused the refund.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /admin/places:
+    get:
+      tags: [Admin]
+      summary: List all places, including hidden ones
+      operationId: adminListPlaces
+      x-requirements: [FR-58]
+      parameters:
+        - name: category
+          in: query
+          schema: { $ref: '#/components/schemas/PlaceCategory' }
+        - name: visible
+          in: query
+          schema: { type: boolean }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageEnvelope'
+                  - type: object
+                    properties:
+                      content:
+                        type: array
+                        items: { $ref: '#/components/schemas/Place' }
+    post:
+      tags: [Admin]
+      summary: Add a place
+      operationId: adminCreatePlace
+      x-requirements: [FR-58]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PlaceInput' }
+      responses:
+        '201':
+          description: Created, hidden until `visible` is set true.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Place' }
+
+  /admin/places/{placeId}:
+    patch:
+      tags: [Admin]
+      summary: Update a place
+      operationId: adminUpdatePlace
+      x-requirements: [FR-58]
+      parameters:
+        - name: placeId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PlaceInput' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Place' }
+    delete:
+      tags: [Admin]
+      summary: Remove a place
+      description: "Soft delete — sets `visible` false and keeps the row."
+      operationId: adminDeletePlace
+      x-requirements: [FR-58]
+      parameters:
+        - name: placeId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '204': { description: Hidden. }
+
+  /admin/blog:
+    get:
+      tags: [Admin]
+      summary: List all posts, drafts included
+      operationId: adminListBlogPosts
+      x-requirements: [FR-60]
+      parameters:
+        - name: status
+          in: query
+          schema: { type: string, enum: [DRAFT, PUBLISHED, ARCHIVED] }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PageEnvelope'
+                  - type: object
+                    properties:
+                      content:
+                        type: array
+                        items: { $ref: '#/components/schemas/BlogPostSummary' }
+    post:
+      tags: [Admin]
+      summary: Create a draft post
+      description: |
+        Always created as `DRAFT`. There is no way to create something already
+        published — writing and publishing are separate acts, and collapsing them
+        is how a half-finished article goes live.
+      operationId: adminCreateBlogPost
+      x-requirements: [FR-60]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BlogPostInput' }
+      responses:
+        '201':
+          description: Draft created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BlogPost' }
+        '409':
+          description: Slug already taken.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /admin/blog/{postId}:
+    patch:
+      tags: [Admin]
+      summary: Edit a post
+      operationId: adminUpdateBlogPost
+      x-requirements: [FR-60]
+      parameters:
+        - $ref: '#/components/parameters/PostId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BlogPostInput' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BlogPost' }
+    delete:
+      tags: [Admin]
+      summary: Archive a post
+      description: Sets `ARCHIVED`. The slug stays reserved so old links do not resolve to something new.
+      operationId: adminDeleteBlogPost
+      x-requirements: [FR-60]
+      parameters:
+        - $ref: '#/components/parameters/PostId'
+      responses:
+        '204': { description: Archived. }
+
+  /admin/blog/{postId}/publish:
+    post:
+      tags: [Admin]
+      summary: Publish or unpublish a post
+      operationId: adminPublishBlogPost
+      x-requirements: [FR-60]
+      parameters:
+        - $ref: '#/components/parameters/PostId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [publish]
+              properties:
+                publish: { type: boolean }
+      responses:
+        '200':
+          description: Status changed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BlogPost' }
+        '400':
+          description: Cannot publish a post with no title, body or cover image.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /admin/uploads:
+    post:
+      tags: [Admin]
+      summary: Upload an image for a place or article
+      operationId: adminUploadImage
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+      responses:
+        '201':
+          description: Uploaded
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Photo' }
+
+  /admin/metrics:
+    get:
+      tags: [Admin]
+      summary: Platform metrics
+      operationId: adminGetMetrics
+      x-requirements: [FR-81, FR-82]
+      parameters:
+        - name: from
+          in: query
+          schema: { type: string, format: date }
+        - name: to
+          in: query
+          schema: { type: string, format: date }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PlatformMetrics' }
+
+  /admin/reviews/{reviewId}:
+    delete:
+      tags: [Admin]
+      summary: Remove an abusive review
+      operationId: adminDeleteReview
+      x-requirements: [FR-83]
+      parameters:
+        - name: reviewId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string, maxLength: 500 }
+      responses:
+        '204': { description: Removed. }
+
+# ─────────────────────────────────────────────────────────────────────────
+# COMPONENTS
+# ─────────────────────────────────────────────────────────────────────────
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        `Authorization: Bearer <accessToken>`. The token carries `sub`, `roles`
+        and, for shop users, `shopId`. Access token lives 15 minutes; refresh
+        token 30 days.
+
+  parameters:
+    Page:
+      name: page
+      in: query
+      schema: { type: integer, minimum: 0, default: 0 }
+    Size:
+      name: size
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    BookingId:
+      name: bookingId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    PostId:
+      name: postId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    MotorbikeId:
+      name: motorbikeId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    BadRequest:
+      description: Validation failed.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: Missing, expired or invalid token.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: Authenticated but not permitted.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: |
+        Not found, or not visible to the caller. Used instead of `403` for
+        resources belonging to another shop or customer, so that ids cannot be
+        probed.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    TooManyRequests:
+      description: |
+        Rate limit exceeded. `Retry-After` gives the seconds to wait. Applied to
+        OTP and password-reset endpoints, per phone number and per IP.
+      headers:
+        Retry-After:
+          schema: { type: integer }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            code: TOO_MANY_REQUESTS
+            message: Too many attempts. Try again in 15 minutes.
+    IllegalTransition:
+      description: |
+        The booking is not in a state that allows this action. The message names
+        the current state so the client can refresh rather than guess.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            code: ILLEGAL_STATE_TRANSITION
+            message: Cannot confirm a booking that is already CANCELLED.
+
+  schemas:
+
+    Money:
+      type: string
+      pattern: '^-?[0-9]+(\.[0-9]{2})$'
+      description: |
+        Decimal amount as a string, always two decimal places. A string, not a
+        number, so cents survive the round trip through JSON. Parse with
+        `BigDecimal` / `Decimal`, never `double`.
+      examples: ["18.00", "0.50"]
+
+    Currency:
+      type: string
+      enum: [USD, KHR]
+      default: USD
+
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: |
+            Stable machine-readable identifier. Flutter switches on this; it
+            never parses `message`. New codes may be added, so clients must have
+            a default branch.
+          examples: ["NO_UNITS_AVAILABLE"]
+        message:
+          type: string
+          description: Human-readable, safe to show the user.
+        field:
+          type: string
+          description: Present for validation errors — which input was wrong.
+        timestamp:
+          type: string
+          format: date-time
+        traceId:
+          type: string
+          description: Correlates with server logs when a student reports a bug.
+
+    PageEnvelope:
+      type: object
+      required: [content, page, size, totalElements, totalPages]
+      properties:
+        content:
+          type: array
+          items: {}
+        page: { type: integer }
+        size: { type: integer }
+        totalElements: { type: integer, format: int64 }
+        totalPages: { type: integer }
+
+    RegisterRequest:
+      type: object
+      required: [fullName, phone, password]
+      properties:
+        fullName: { type: string, minLength: 2, maxLength: 120 }
+        phone:
+          type: string
+          description: E.164. Cambodian numbers are normalised to +855 on entry.
+          examples: ["+85512345678"]
+        email: { type: string, format: email }
+        password:
+          type: string
+          format: password
+          minLength: 8
+          description: Stored as a BCrypt hash. Never returned by any endpoint.
+        preferredLanguage: { type: string, enum: [km, en], default: en }
+
+    AuthTokens:
+      type: object
+      required: [accessToken, refreshToken, expiresIn]
+      properties:
+        accessToken: { type: string }
+        refreshToken: { type: string }
+        tokenType: { type: string, default: Bearer }
+        expiresIn: { type: integer, description: Access token lifetime in seconds. }
+        user: { $ref: '#/components/schemas/Me' }
+
+    Me:
+      type: object
+      required: [id, fullName, phone, roles, phoneVerified]
+      properties:
+        id: { type: string, format: uuid }
+        fullName: { type: string }
+        phone: { type: string }
+        email: { type: string }
+        roles:
+          type: array
+          items: { type: string, enum: [CUSTOMER, SHOP_OWNER, SHOP_STAFF, ADMIN] }
+        phoneVerified:
+          type: boolean
+          description: |
+            Gates booking. False for a freshly Google-created account, which has
+            an identity but no reachable phone number.
+        emailVerified:
+          type: boolean
+          description: |
+            True only when the address was actually proved — set by Google
+            sign-in, or by an email confirmation link. A typed-in address is
+            never verified, and this flag is what `POST /auth/google` consults
+            before auto-linking.
+        authProviders:
+          type: array
+          description: |
+            How this account can be signed into. A Google-created account has
+            `[GOOGLE]` and no password until `/auth/password/set` is called; the
+            client uses this to decide whether to show "change password" or
+            "set password".
+          items: { type: string, enum: [PASSWORD, GOOGLE] }
+        preferredLanguage: { type: string, enum: [km, en] }
+        shopId:
+          type: string
+          format: uuid
+          description: Present for SHOP_OWNER and SHOP_STAFF.
+        shopStatus: { $ref: '#/components/schemas/ShopStatus' }
+
+    MotorbikeType:
+      type: string
+      enum: [SCOOTER, SEMI_AUTOMATIC, MANUAL, DIRT_BIKE, ELECTRIC]
+
+    MotorbikeStatus:
+      type: string
+      enum: [ACTIVE, MAINTENANCE, INACTIVE]
+      description: |
+        The **stored** state of a physical unit — what the shop controls.
+        Deliberately excludes `BOOKED` and `RENTED`: those are conclusions drawn
+        from the booking table for a given date, not facts about the bike. Two
+        sources of truth for availability is how double-bookings happen.
+
+    TodayStatus:
+      type: string
+      enum: [FREE, OUT, MAINTENANCE, INACTIVE]
+      readOnly: true
+      description: |
+        Derived, never stored. `OUT` means this unit has an `ACTIVE` booking
+        today. Read-only in every response; sending it is ignored.
+
+    ModelSearchResult:
+      type: object
+      description: |
+        One shop's offering of one model, for the requested dates. `availableUnits`
+        is the count of that shop's units of that model with no overlapping
+        booking — it is why `plateNumber` is absent here: the customer is not
+        choosing a specific bike, and exposing plates would let anyone enumerate
+        a shop's fleet.
+      required: [shopId, shopName, model, pricePerDay, currency, availableUnits]
+      properties:
+        shopId: { type: string, format: uuid }
+        shopName: { type: string }
+        shopRating: { type: number, format: float, minimum: 0, maximum: 5 }
+        shopReviewCount: { type: integer }
+        shopVerified: { type: boolean }
+        model: { type: string }
+        brand: { type: string }
+        type: { $ref: '#/components/schemas/MotorbikeType' }
+        transmission: { type: string, enum: [AUTOMATIC, MANUAL, SEMI_AUTOMATIC] }
+        engineCc: { type: integer }
+        pricePerDay: { $ref: '#/components/schemas/Money' }
+        currency: { $ref: '#/components/schemas/Currency' }
+        availableUnits:
+          type: integer
+          minimum: 1
+          description: Always ≥ 1; models with nothing free are omitted, not returned as 0.
+        primaryPhotoUrl: { type: string, format: uri }
+        offersDelivery: { type: boolean }
+        deliveryFee: { $ref: '#/components/schemas/Money' }
+        distanceKm:
+          type: number
+          format: float
+          description: Straight-line distance from the customer's position, when supplied.
+
+    ModelDetail:
+      allOf:
+        - $ref: '#/components/schemas/ModelSearchResult'
+        - type: object
+          properties:
+            description: { type: string }
+            photoUrls:
+              type: array
+              items: { type: string, format: uri }
+            features:
+              type: array
+              items: { type: string }
+              examples: [["Helmet included", "Phone holder", "USB charger"]]
+            quote:
+              $ref: '#/components/schemas/Quote'
+            shop: { $ref: '#/components/schemas/ShopPublic' }
+            recentReviews:
+              type: array
+              items: { $ref: '#/components/schemas/Review' }
+              maxItems: 5
+
+    ShopStatus:
+      type: string
+      enum: [PENDING_VERIFICATION, VERIFIED, REJECTED, SUSPENDED]
+
+    ShopPublic:
+      type: object
+      description: The customer-facing view of a shop. No revenue, no payout data.
+      required: [id, name, status]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        status: { $ref: '#/components/schemas/ShopStatus' }
+        verified: { type: boolean }
+        description: { type: string }
+        address: { type: string }
+        latitude: { type: number, format: double }
+        longitude: { type: number, format: double }
+        phone: { type: string }
+        photoUrls:
+          type: array
+          items: { type: string, format: uri }
+        openingHours:
+          type: array
+          items:
+            type: object
+            properties:
+              dayOfWeek: { type: integer, minimum: 1, maximum: 7 }
+              opensAt: { type: string, examples: ["07:30"] }
+              closesAt: { type: string, examples: ["19:00"] }
+              closed: { type: boolean }
+        rating: { type: number, format: float }
+        reviewCount: { type: integer }
+        offersDelivery: { type: boolean }
+        deliveryFee: { $ref: '#/components/schemas/Money' }
+        rentalRequirements:
+          type: array
+          items: { type: string }
+          examples: [["Passport or ID held as deposit", "Minimum age 18"]]
+        cancellationPolicy: { type: string }
+        acceptsPayAtShop: { type: boolean }
+
+    ShopApplication:
+      type: object
+      required: [name, phone, address, latitude, longitude]
+      properties:
+        name: { type: string, maxLength: 150 }
+        description: { type: string, maxLength: 2000 }
+        phone: { type: string }
+        email: { type: string, format: email }
+        address: { type: string }
+        latitude: { type: number, format: double }
+        longitude: { type: number, format: double }
+        offersDelivery: { type: boolean, default: false }
+        deliveryFee: { $ref: '#/components/schemas/Money' }
+        acceptsPayAtShop: { type: boolean, default: true }
+
+    ShopUpdate:
+      type: object
+      description: |
+        `status` is absent on purpose. A shop cannot verify or un-suspend itself.
+      properties:
+        name: { type: string }
+        description: { type: string }
+        phone: { type: string }
+        address: { type: string }
+        latitude: { type: number, format: double }
+        longitude: { type: number, format: double }
+        offersDelivery: { type: boolean }
+        deliveryFee: { $ref: '#/components/schemas/Money' }
+        acceptsPayAtShop: { type: boolean }
+        cancellationPolicy: { type: string }
+        rentalRequirements:
+          type: array
+          items: { type: string }
+
+    ShopAdmin:
+      allOf:
+        - $ref: '#/components/schemas/ShopPublic'
+        - type: object
+          properties:
+            ownerId: { type: string, format: uuid }
+            ownerName: { type: string }
+            createdAt: { type: string, format: date-time }
+            verifiedAt: { type: string, format: date-time }
+            verificationNote: { type: string }
+            suspensionReason: { type: string }
+            payoutAccountConfigured:
+              type: boolean
+              description: |
+                False means this shop cannot be paid. The dashboard should nag
+                until it is true — a shop discovering at handover that it has no
+                payout account is the worst time to find out.
+            unitCount: { type: integer }
+
+    MotorbikeInput:
+      type: object
+      required: [brand, model, type, plateNumber, pricePerDay]
+      properties:
+        brand: { type: string, examples: ["Honda"] }
+        model:
+          type: string
+          description: |
+            Units that share a model string group into one search result, so
+            spelling matters: "Honda Dream 125" and "honda dream125" would show
+            as two products. The server trims and collapses whitespace; the shop
+            UI should offer previously used models as suggestions.
+          examples: ["Honda Dream 125"]
+        type: { $ref: '#/components/schemas/MotorbikeType' }
+        transmission: { type: string, enum: [AUTOMATIC, MANUAL, SEMI_AUTOMATIC] }
+        engineCc: { type: integer, minimum: 50, maximum: 1500 }
+        year: { type: integer }
+        color: { type: string }
+        plateNumber:
+          type: string
+          description: Unique within the shop. Never exposed to customers.
+          examples: ["1AB-2345"]
+        pricePerDay: { $ref: '#/components/schemas/Money' }
+        currency: { $ref: '#/components/schemas/Currency' }
+        description: { type: string, maxLength: 1000 }
+        features:
+          type: array
+          items: { type: string }
+
+    MotorbikeUpdate:
+      type: object
+      properties:
+        pricePerDay:
+          allOf: [{ $ref: '#/components/schemas/Money' }]
+          description: |
+            Affects future bookings only. Existing bookings keep the price
+            snapshotted on their booking item.
+        status: { $ref: '#/components/schemas/MotorbikeStatus' }
+        color: { type: string }
+        description: { type: string }
+        features:
+          type: array
+          items: { type: string }
+
+    MotorbikeAdmin:
+      type: object
+      description: The shop's and admin's view of a physical unit.
+      required: [id, brand, model, plateNumber, pricePerDay, status]
+      properties:
+        id: { type: string, format: uuid }
+        brand: { type: string }
+        model: { type: string }
+        type: { $ref: '#/components/schemas/MotorbikeType' }
+        transmission: { type: string, enum: [AUTOMATIC, MANUAL, SEMI_AUTOMATIC] }
+        engineCc: { type: integer }
+        year: { type: integer }
+        color: { type: string }
+        plateNumber: { type: string }
+        pricePerDay: { $ref: '#/components/schemas/Money' }
+        currency: { $ref: '#/components/schemas/Currency' }
+        status: { $ref: '#/components/schemas/MotorbikeStatus' }
+        todayStatus: { $ref: '#/components/schemas/TodayStatus' }
+        photoUrls:
+          type: array
+          items: { type: string, format: uri }
+        nextBookingDate:
+          type: string
+          format: date
+          description: Next confirmed pickup for this unit, if any.
+        affectedBookings:
+          type: array
+          readOnly: true
+          description: |
+            Returned after a status change to `MAINTENANCE` or `INACTIVE`:
+            bookings that still expect this unit and need the shop's attention.
+          items: { $ref: '#/components/schemas/BookingSummary' }
+        createdAt: { type: string, format: date-time }
+
+    Photo:
+      type: object
+      required: [id, url]
+      properties:
+        id: { type: string, format: uuid }
+        url: { type: string, format: uri }
+        thumbnailUrl: { type: string, format: uri }
+        isPrimary: { type: boolean }
+        uploadedAt: { type: string, format: date-time }
+
+    PickupMethod:
+      type: string
+      enum: [SHOP_PICKUP, DELIVERY]
+
+    PaymentOption:
+      type: string
+      enum: [PAY_NOW, PAY_AT_SHOP]
+      description: |
+        Both settle identically — the shop receives the same net amount and the
+        platform the same fee either way. Making `PAY_AT_SHOP` equally
+        profitable for the shop is what removes the incentive to take the
+        booking off-platform.
+
+    BookingRequest:
+      type: object
+      description: Same body for `/bookings/quote` and `/bookings`.
+      required: [shopId, model, startDate, endDate, pickupMethod, paymentOption]
+      properties:
+        shopId: { type: string, format: uuid }
+        model:
+          type: string
+          description: |
+            A model name, not a motorbike id. The server chooses the unit under
+            a lock; letting the client pick would reintroduce the race it is
+            trying to avoid.
+        startDate: { type: string, format: date }
+        endDate:
+          type: string
+          format: date
+          description: Exclusive. Must be after `startDate`, at most 30 days later.
+        pickupMethod: { $ref: '#/components/schemas/PickupMethod' }
+        deliveryAddress:
+          type: string
+          description: Required when `pickupMethod` is `DELIVERY`.
+        deliveryLatitude: { type: number, format: double }
+        deliveryLongitude: { type: number, format: double }
+        paymentOption: { $ref: '#/components/schemas/PaymentOption' }
+        customerNote: { type: string, maxLength: 500 }
+
+    Quote:
+      type: object
+      required: [shopId, model, startDate, endDate, rentalDays, subtotal, total, currency]
+      properties:
+        shopId: { type: string, format: uuid }
+        shopName: { type: string }
+        model: { type: string }
+        startDate: { type: string, format: date }
+        endDate: { type: string, format: date }
+        rentalDays:
+          type: integer
+          minimum: 1
+          description: '`endDate - startDate` in days. Never zero — minimum rental is one day.'
+        pricePerDay: { $ref: '#/components/schemas/Money' }
+        subtotal: { $ref: '#/components/schemas/Money' }
+        deliveryFee: { $ref: '#/components/schemas/Money' }
+        total: { $ref: '#/components/schemas/Money' }
+        currency: { $ref: '#/components/schemas/Currency' }
+        platformFee:
+          allOf: [{ $ref: '#/components/schemas/Money' }]
+          description: |
+            `10% x subtotal`, rounded half-up to the cent. V1 rate.
+
+            **The delivery fee is not commissionable.** It reimburses the shop
+            for a staff member riding the bike to the hotel — petrol and labour
+            the shop pays out of pocket. Taking a cut of it would make delivery
+            loss-making, the shop would stop offering it, and the platform would
+            lose one of its few differentiators against a Facebook page.
+        commissionRate:
+          type: number
+          format: float
+          description: |
+            The rate applied to this booking, e.g. `0.10`. Returned so the client
+            never hardcodes it, and **snapshotted onto the booking** so that
+            changing the platform rate later cannot rewrite past bookings —
+            the same reason `pricePerDay` is copied onto the booking item.
+        shopPayout:
+          allOf: [{ $ref: '#/components/schemas/Money' }]
+          description: '`total - platformFee`. What actually reaches the shop.'
+        availableUnits:
+          type: integer
+          description: |
+            Advisory only. A quote holds nothing; `POST /bookings` is the only
+            authority on availability.
+        paymentOptions:
+          type: array
+          items: { $ref: '#/components/schemas/PaymentOption' }
+
+    BookingStatus:
+      type: string
+      enum: [PENDING, CONFIRMED, ACTIVE, COMPLETED, REJECTED, CANCELLED, EXPIRED]
+      description: |
+        ```
+        PENDING ──confirm──> CONFIRMED ──handover──> ACTIVE ──return──> COMPLETED
+           │                     │
+           ├──reject──> REJECTED │
+           ├──cancel──> CANCELLED <──cancel──┘
+           └──hold expiry──> EXPIRED
+        ```
+        Terminal states are `COMPLETED`, `REJECTED`, `CANCELLED`, `EXPIRED`.
+        Only `PENDING`, `CONFIRMED` and `ACTIVE` block availability.
+
+    PaymentStatus:
+      type: string
+      enum: [UNPAID, PENDING, PAID, FAILED, REFUNDED, PARTIALLY_REFUNDED, AMOUNT_MISMATCH]
+
+    PayoutStatus:
+      type: string
+      enum: [NOT_DUE, PENDING, SENT, FAILED]
+
+    BookingSummary:
+      type: object
+      description: List-row projection. The detail endpoint returns more.
+      required: [id, reference, status, startDate, endDate, total, currency]
+      properties:
+        id: { type: string, format: uuid }
+        reference:
+          type: string
+          description: Short human reference read aloud at the shop counter.
+          examples: ["SR-000128"]
+        status: { $ref: '#/components/schemas/BookingStatus' }
+        paymentStatus: { $ref: '#/components/schemas/PaymentStatus' }
+        shopId: { type: string, format: uuid }
+        shopName: { type: string }
+        customerName:
+          type: string
+          description: Present for shop and admin callers only.
+        model: { type: string }
+        primaryPhotoUrl: { type: string, format: uri }
+        startDate: { type: string, format: date }
+        endDate: { type: string, format: date }
+        rentalDays: { type: integer }
+        total: { $ref: '#/components/schemas/Money' }
+        currency: { $ref: '#/components/schemas/Currency' }
+        pickupMethod: { $ref: '#/components/schemas/PickupMethod' }
+        holdExpiresAt:
+          type: string
+          format: date-time
+          description: |
+            Present while `PENDING`. The shop UI counts down against it; the
+            customer UI shows "waiting for the shop".
+        createdAt: { type: string, format: date-time }
+
+    Booking:
+      allOf:
+        - $ref: '#/components/schemas/BookingSummary'
+        - type: object
+          properties:
+            customer:
+              $ref: '#/components/schemas/BookingCustomer'
+            shop: { $ref: '#/components/schemas/ShopPublic' }
+            item: { $ref: '#/components/schemas/BookingItem' }
+            deliveryAddress: { type: string }
+            deliveryLatitude: { type: number, format: double }
+            deliveryLongitude: { type: number, format: double }
+            paymentOption: { $ref: '#/components/schemas/PaymentOption' }
+            platformFee: { $ref: '#/components/schemas/Money' }
+            shopPayout: { $ref: '#/components/schemas/Money' }
+            payoutStatus: { $ref: '#/components/schemas/PayoutStatus' }
+            lateFee: { $ref: '#/components/schemas/Money' }
+            damageFee: { $ref: '#/components/schemas/Money' }
+            refundAmount: { $ref: '#/components/schemas/Money' }
+            cancellationReason: { type: string }
+            rejectionReason: { type: string }
+            customerNote: { type: string }
+            handover: { $ref: '#/components/schemas/ConditionRecord' }
+            return: { $ref: '#/components/schemas/ConditionRecord' }
+            confirmedAt: { type: string, format: date-time }
+            activatedAt: { type: string, format: date-time }
+            completedAt: { type: string, format: date-time }
+            canReview:
+              type: boolean
+              description: |
+                Server-decided. Saves the client from reimplementing "completed
+                and not yet reviewed" and getting it subtly wrong.
+
+    BookingCustomer:
+      type: object
+      description: |
+        What the shop is allowed to see about the customer.
+      properties:
+        id: { type: string, format: uuid }
+        fullName: { type: string }
+        phone:
+          type: string
+          nullable: true
+          description: |
+            **Null until the booking is `CONFIRMED`** (FR-25). A shop that could
+            read the phone number of a pending request could reject it and call
+            the customer directly, and the platform would have handed over the
+            lead for nothing.
+        preferredLanguage: { type: string, enum: [km, en] }
+
+    BookingItem:
+      type: object
+      description: |
+        The snapshot. `model`, `pricePerDay` and `deliveryFee` are copied here at
+        creation and never updated. When a shop raises its price next month,
+        this booking's history stays true — without the copy, every past
+        receipt silently rewrites itself.
+      required: [model, pricePerDay, rentalDays, subtotal]
+      properties:
+        model: { type: string }
+        brand: { type: string }
+        pricePerDay: { $ref: '#/components/schemas/Money' }
+        rentalDays: { type: integer }
+        subtotal: { $ref: '#/components/schemas/Money' }
+        deliveryFee: { $ref: '#/components/schemas/Money' }
+        assignedMotorbikeId:
+          type: string
+          format: uuid
+          description: The unit the system locked at creation.
+        assignedPlateNumber:
+          type: string
+          description: |
+            Shop and admin only. Absent from every customer-facing response,
+            including this booking when the customer reads it.
+        actualMotorbikeId:
+          type: string
+          format: uuid
+          description: Set at handover when a different unit was given out.
+        actualPlateNumber: { type: string }
+
+    ConditionRecord:
+      type: object
+      description: Condition at handover or at return. Evidence in a dispute.
+      properties:
+        recordedAt: { type: string, format: date-time }
+        recordedByName: { type: string }
+        odometerReading: { type: integer }
+        fuelLevel: { type: string, enum: [EMPTY, QUARTER, HALF, THREE_QUARTER, FULL] }
+        note: { type: string }
+        photoUrls:
+          type: array
+          items: { type: string, format: uri }
+
+    PaymentIntent:
+      type: object
+      required: [paymentId, bookingId, status, amount, currency, method]
+      properties:
+        paymentId: { type: string, format: uuid }
+        bookingId: { type: string, format: uuid }
+        status: { $ref: '#/components/schemas/PaymentStatus' }
+        amount: { $ref: '#/components/schemas/Money' }
+        currency: { $ref: '#/components/schemas/Currency' }
+        method: { type: string, enum: [KHQR, ABA_PAY, CASH] }
+        qrPayload:
+          type: string
+          description: EMVCo/KHQR string. The client renders it as a QR image locally.
+        deeplink: { type: string, format: uri }
+        transactionId: { type: string }
+        expiresAt: { type: string, format: date-time }
+        paidAt: { type: string, format: date-time }
+        failureReason: { type: string }
+
+    PayoutAccount:
+      type: object
+      required: [bank, accountHolderName, last4, beneficiaryReference]
+      properties:
+        bank: { type: string, enum: [ABA, ACLEDA, WING, OTHER] }
+        accountHolderName: { type: string }
+        last4:
+          type: string
+          pattern: '^[0-9]{4}$'
+          description: Enough for the shop to recognise the account. Nothing more is kept.
+        beneficiaryReference:
+          type: string
+          description: Opaque provider token used to address the transfer.
+        verified: { type: boolean }
+        registeredAt: { type: string, format: date-time }
+
+    Payout:
+      type: object
+      required: [id, bookingId, amount, currency, status]
+      properties:
+        id: { type: string, format: uuid }
+        bookingId: { type: string, format: uuid }
+        bookingReference: { type: string }
+        grossAmount: { $ref: '#/components/schemas/Money' }
+        platformFee: { $ref: '#/components/schemas/Money' }
+        amount:
+          allOf: [{ $ref: '#/components/schemas/Money' }]
+          description: Net amount sent to the shop.
+        currency: { $ref: '#/components/schemas/Currency' }
+        status: { $ref: '#/components/schemas/PayoutStatus' }
+        attemptCount: { type: integer }
+        failureReason: { type: string }
+        providerReference: { type: string }
+        sentAt: { type: string, format: date-time }
+        createdAt: { type: string, format: date-time }
+
+    ShopDashboard:
+      type: object
+      properties:
+        pendingRequests: { type: integer }
+        todayPickups: { type: integer }
+        todayReturns: { type: integer }
+        activeRentals: { type: integer }
+        unitsTotal: { type: integer }
+        unitsFreeToday: { type: integer }
+        unitsInMaintenance: { type: integer }
+        openAssistanceRequests: { type: integer }
+        revenueThisMonth: { $ref: '#/components/schemas/Money' }
+        payoutThisMonth: { $ref: '#/components/schemas/Money' }
+        platformFeeThisMonth: { $ref: '#/components/schemas/Money' }
+        currency: { $ref: '#/components/schemas/Currency' }
+        rating: { type: number, format: float }
+        payoutAccountConfigured: { type: boolean }
+
+    PlatformMetrics:
+      type: object
+      properties:
+        from: { type: string, format: date }
+        to: { type: string, format: date }
+        customers: { type: integer }
+        shopsVerified: { type: integer }
+        shopsPendingVerification: { type: integer }
+        units: { type: integer }
+        bookingsCreated: { type: integer }
+        bookingsCompleted: { type: integer }
+        bookingsCancelled: { type: integer }
+        bookingsExpired: { type: integer }
+        confirmationRate:
+          type: number
+          format: float
+          description: |
+            Confirmed ÷ created. The platform's real health metric: a low rate
+            means shops are not answering, which is the failure mode that kills
+            marketplaces like this one.
+        grossBookingValue: { $ref: '#/components/schemas/Money' }
+        platformRevenue: { $ref: '#/components/schemas/Money' }
+        currency: { $ref: '#/components/schemas/Currency' }
+
+    PlaceCategory:
+      type: string
+      enum:
+        - TEMPLE
+        - ATTRACTION
+        - RESTAURANT
+        - CAFE
+        - MARKET
+        - NIGHTLIFE
+        - SHOPPING
+        - NATURE
+        - MUSEUM
+        - OTHER
+
+    PlaceInput:
+      type: object
+      required: [name, category, latitude, longitude]
+      properties:
+        name: { type: string, maxLength: 150 }
+        category: { $ref: '#/components/schemas/PlaceCategory' }
+        description: { type: string, maxLength: 3000 }
+        address: { type: string }
+        latitude: { type: number, format: double }
+        longitude: { type: number, format: double }
+        photoUrls:
+          type: array
+          items: { type: string, format: uri }
+          description: URLs returned by `POST /admin/uploads`.
+        entranceFee:
+          type: string
+          description: |
+            Free text, not Money. "Included in Angkor Pass", "Free", "$5 for
+            foreigners" — a number cannot express any of these, and forcing one
+            would make the field lie.
+        openingHours: { type: string, examples: ["05:00 – 18:00"] }
+        estimatedRideMinutes:
+          type: integer
+          description: Rough ride time from central Siem Reap, by motorbike.
+        tips:
+          type: array
+          items: { type: string }
+          examples: [["Go at sunrise to avoid crowds", "Bring cash, no card accepted"]]
+        featured: { type: boolean, default: false }
+        visible: { type: boolean, default: false }
+
+    Place:
+      allOf:
+        - $ref: '#/components/schemas/PlaceInput'
+        - type: object
+          required: [id]
+          properties:
+            id: { type: string, format: uuid }
+            distanceKm:
+              type: number
+              format: float
+              description: Present only when the request supplied a position.
+            createdAt: { type: string, format: date-time }
+
+    BlogPostStatus:
+      type: string
+      enum: [DRAFT, PUBLISHED, ARCHIVED]
+
+    BlogPostInput:
+      type: object
+      required: [title, slug]
+      properties:
+        title: { type: string, maxLength: 200 }
+        slug:
+          type: string
+          pattern: '^[a-z0-9]+(-[a-z0-9]+)*$'
+          description: |
+            Lowercase, hyphenated, unique. Immutable once published — changing it
+            breaks every link already shared.
+          examples: [five-rides-around-siem-reap]
+        excerpt: { type: string, maxLength: 400 }
+        body:
+          type: string
+          description: Markdown. Rendered client-side, and sanitised before render.
+        coverImageUrl: { type: string, format: uri }
+        tags:
+          type: array
+          items: { type: string }
+        placeIds:
+          type: array
+          items: { type: string, format: uuid }
+          description: |
+            Places this article features, so the app can show them on a map under
+            the text instead of repeating the details in prose.
+
+    BlogPostSummary:
+      type: object
+      required: [id, title, slug, status]
+      properties:
+        id: { type: string, format: uuid }
+        title: { type: string }
+        slug: { type: string }
+        excerpt: { type: string }
+        coverImageUrl: { type: string, format: uri }
+        tags:
+          type: array
+          items: { type: string }
+        status: { $ref: '#/components/schemas/BlogPostStatus' }
+        readMinutes: { type: integer }
+        publishedAt: { type: string, format: date-time }
+
+    BlogPost:
+      allOf:
+        - $ref: '#/components/schemas/BlogPostSummary'
+        - type: object
+          properties:
+            body: { type: string, description: Markdown. }
+            places:
+              type: array
+              items: { $ref: '#/components/schemas/Place' }
+            authorName: { type: string }
+            updatedAt: { type: string, format: date-time }
+
+    Notification:
+      type: object
+      required: [id, type, title, read, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        type:
+          type: string
+          enum:
+            - BOOKING_CREATED
+            - BOOKING_CONFIRMED
+            - BOOKING_REJECTED
+            - BOOKING_CANCELLED
+            - BOOKING_EXPIRED
+            - PAYMENT_RECEIVED
+            - PAYMENT_FAILED
+            - PICKUP_REMINDER
+            - RETURN_REMINDER
+            - LATE_RETURN
+            - ASSISTANCE_REQUESTED
+            - ASSISTANCE_RESOLVED
+            - PAYOUT_SENT
+            - PAYOUT_FAILED
+            - SHOP_VERIFIED
+            - SHOP_REJECTED
+            - REVIEW_RECEIVED
+        title: { type: string }
+        body: { type: string }
+        bookingId:
+          type: string
+          format: uuid
+          description: Present where the notification concerns a booking — enables deep-linking.
+        read: { type: boolean }
+        createdAt: { type: string, format: date-time }
+
+    ExtensionQuote:
+      type: object
+      required: [bookingId, currentEndDate, newEndDate, extraDays, extraAmount, currency]
+      properties:
+        bookingId: { type: string, format: uuid }
+        currentEndDate: { type: string, format: date }
+        newEndDate: { type: string, format: date }
+        extraDays: { type: integer, minimum: 1 }
+        pricePerDay:
+          allOf: [{ $ref: '#/components/schemas/Money' }]
+          description: |
+            The price snapshotted on the original booking, not today's shop price.
+            A customer who extends should not be repriced mid-rental because the
+            shop raised its rate this morning.
+        extraAmount: { $ref: '#/components/schemas/Money' }
+        currency: { $ref: '#/components/schemas/Currency' }
+        platformFee: { $ref: '#/components/schemas/Money' }
+        shopPayout: { $ref: '#/components/schemas/Money' }
+        unitAvailable:
+          type: boolean
+          description: |
+            Advisory. `POST /bookings/{id}/extend` re-checks under a lock, and it
+            is the only authority.
+
+    CustomerAdmin:
+      type: object
+      description: |
+        Admin's view of a customer. No password hash, no payout data, no OTP.
+      properties:
+        id: { type: string, format: uuid }
+        fullName: { type: string }
+        phone: { type: string }
+        email: { type: string }
+        phoneVerified: { type: boolean }
+        status: { type: string, enum: [ACTIVE, SUSPENDED] }
+        suspensionReason: { type: string }
+        authProviders:
+          type: array
+          items: { type: string, enum: [PASSWORD, GOOGLE] }
+        bookingsTotal: { type: integer }
+        bookingsCompleted: { type: integer }
+        bookingsCancelled: { type: integer }
+        isShopOwner: { type: boolean }
+        createdAt: { type: string, format: date-time }
+        lastActiveAt: { type: string, format: date-time }
+
+    StaffMember:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        fullName: { type: string }
+        phone: { type: string }
+        role: { type: string, enum: [SHOP_OWNER, SHOP_STAFF] }
+        status: { type: string, enum: [INVITED, ACTIVE, DISABLED] }
+        invitedAt: { type: string, format: date-time }
+
+    AssistanceRequest:
+      type: object
+      required: [id, bookingId, problemType, status, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        bookingId: { type: string, format: uuid }
+        bookingReference: { type: string }
+        customerName: { type: string }
+        customerPhone: { type: string }
+        model: { type: string }
+        plateNumber:
+          type: string
+          description: Shop view only — the staff member needs to know which bike to find.
+        problemType:
+          type: string
+          enum: [FLAT_TYRE, WONT_START, ACCIDENT, OUT_OF_FUEL, OTHER]
+        description: { type: string }
+        latitude: { type: number, format: double }
+        longitude: { type: number, format: double }
+        status: { type: string, enum: [OPEN, IN_PROGRESS, RESOLVED] }
+        resolutionNote: { type: string }
+        replacementMotorbikeId: { type: string, format: uuid }
+        createdAt: { type: string, format: date-time }
+        resolvedAt: { type: string, format: date-time }
+
+    Review:
+      type: object
+      required: [id, rating, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        bookingId: { type: string, format: uuid }
+        customerName:
+          type: string
+          description: Display name only; full name is never shown publicly.
+          examples: ["Sokha C."]
+        model: { type: string }
+        rating: { type: integer, minimum: 1, maximum: 5 }
+        comment: { type: string }
+        shopReply: { type: string }
+        shopRepliedAt: { type: string, format: date-time }
+        createdAt: { type: string, format: date-time }

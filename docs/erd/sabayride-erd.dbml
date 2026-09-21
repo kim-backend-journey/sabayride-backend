@@ -1,0 +1,1006 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// SabayRide — Entity Relationship Diagram
+// Paste into https://dbdiagram.io/d  ·  PostgreSQL 16  ·  v1.0
+//
+// THE ONE RULE THAT SHAPES THIS WHOLE SCHEMA:
+//
+//   There is no `available` column. Anywhere.
+//
+//   Availability is DERIVED from the booking table for a requested date range.
+//   Two sources of truth for whether a bike is free is how double-bookings
+//   happen — a status column and a booking row disagree, and nobody notices
+//   until a customer arrives to a bike that is already gone.
+//
+//   Consequence: `motorbike.status` has no BOOKED and no RENTED value.
+// ═══════════════════════════════════════════════════════════════════════════
+
+
+// ─────────────────────────────────────────────────────────────────────────
+// ENUMS
+// ─────────────────────────────────────────────────────────────────────────
+
+Enum user_status {
+  ACTIVE
+  SUSPENDED
+}
+
+Enum auth_provider {
+  PASSWORD
+  GOOGLE
+}
+
+Enum platform {
+  ANDROID
+  IOS
+}
+
+Enum language {
+  km
+  en
+}
+
+Enum otp_purpose {
+  PHONE_VERIFICATION
+  PASSWORD_RESET
+  PHONE_CHANGE
+}
+
+Enum shop_status {
+  PENDING_VERIFICATION
+  VERIFIED
+  REJECTED
+  SUSPENDED
+}
+
+Enum shop_member_role {
+  SHOP_OWNER
+  SHOP_STAFF
+}
+
+Enum shop_member_status {
+  INVITED
+  ACTIVE
+  DISABLED
+}
+
+Enum bank {
+  ABA
+  ACLEDA
+  WING
+  OTHER
+}
+
+Enum motorbike_type {
+  SCOOTER
+  SEMI_AUTOMATIC
+  MANUAL
+  DIRT_BIKE
+  ELECTRIC
+}
+
+Enum transmission {
+  AUTOMATIC
+  MANUAL
+  SEMI_AUTOMATIC
+}
+
+// No BOOKED. No RENTED. See the header note — this is deliberate and it is
+// the single most important line in this file.
+Enum motorbike_status {
+  ACTIVE
+  MAINTENANCE
+  INACTIVE
+}
+
+Enum booking_status {
+  PENDING    // holds availability, expires on its own
+  CONFIRMED  // holds availability
+  ACTIVE     // holds availability — bike is out
+  COMPLETED  // terminal
+  REJECTED   // terminal
+  CANCELLED  // terminal
+  EXPIRED    // terminal — hold ran out
+}
+
+Enum payment_status {
+  UNPAID
+  PENDING
+  PAID
+  FAILED
+  REFUNDED
+  PARTIALLY_REFUNDED
+  AMOUNT_MISMATCH
+}
+
+Enum payment_method {
+  KHQR
+  ABA_PAY
+  CASH
+}
+
+Enum payment_kind {
+  BOOKING
+  EXTENSION
+}
+
+Enum payout_status {
+  NOT_DUE
+  PENDING
+  SENT
+  FAILED
+}
+
+Enum pickup_method {
+  SHOP_PICKUP
+  DELIVERY
+}
+
+Enum payment_option {
+  PAY_NOW
+  PAY_AT_SHOP
+}
+
+Enum fuel_level {
+  EMPTY
+  QUARTER
+  HALF
+  THREE_QUARTER
+  FULL
+}
+
+Enum condition_kind {
+  HANDOVER
+  RETURN
+}
+
+Enum assistance_problem {
+  FLAT_TYRE
+  WONT_START
+  ACCIDENT
+  OUT_OF_FUEL
+  OTHER
+}
+
+Enum assistance_status {
+  OPEN
+  IN_PROGRESS
+  RESOLVED
+}
+
+Enum rejection_reason {
+  BIKE_UNAVAILABLE
+  SHOP_CLOSED
+  CUSTOMER_UNREACHABLE
+  OTHER
+}
+
+Enum place_category {
+  TEMPLE
+  ATTRACTION
+  RESTAURANT
+  CAFE
+  MARKET
+  NIGHTLIFE
+  SHOPPING
+  NATURE
+  MUSEUM
+  OTHER
+}
+
+Enum blog_status {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+Enum notification_type {
+  BOOKING_CREATED
+  BOOKING_CONFIRMED
+  BOOKING_REJECTED
+  BOOKING_CANCELLED
+  BOOKING_EXPIRED
+  PAYMENT_RECEIVED
+  PAYMENT_FAILED
+  PICKUP_REMINDER
+  RETURN_REMINDER
+  LATE_RETURN
+  ASSISTANCE_REQUESTED
+  ASSISTANCE_RESOLVED
+  PAYOUT_SENT
+  PAYOUT_FAILED
+  SHOP_VERIFIED
+  SHOP_REJECTED
+  REVIEW_RECEIVED
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════
+// IDENTITY
+// ═════════════════════════════════════════════════════════════════════════
+
+Table users {
+  id uuid [pk]
+  full_name varchar(120) [not null]
+  phone varchar(20) [unique]
+  email varchar(255) [unique]
+  phone_verified boolean [not null, default: false]
+  email_verified boolean [not null, default: false]
+  preferred_language language [not null, default: 'en']
+  status user_status [not null, default: 'ACTIVE']
+  suspension_reason text
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+  last_active_at timestamptz
+
+  Note: 'No password column here.'
+}
+
+Table auth_identity {
+  id uuid [pk]
+  user_id uuid [not null]
+  provider auth_provider [not null]
+  provider_subject varchar(255)
+  password_hash varchar(72) [note: 'BCrypt. Null for GOOGLE.']
+  created_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (provider, provider_subject) [unique, name: 'uq_identity_provider_subject']
+    (user_id, provider) [unique, name: 'uq_identity_user_provider']
+    user_id
+  }
+
+  Note: 'One user, many ways in.'
+}
+
+Table user_role {
+  id uuid [pk]
+  user_id uuid [not null]
+  role varchar(20) [not null]
+  created_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (user_id, role) [unique]
+  }
+}
+
+Table refresh_token {
+  id uuid [pk]
+  user_id uuid [not null]
+  token_hash varchar(64) [not null, unique]
+  expires_at timestamptz [not null]
+  revoked_at timestamptz
+  created_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    user_id
+  }
+
+  Note: 'Refresh tokens are stored server-side so that logout and password reset can actually revoke them.'
+}
+
+Table otp_code {
+  id uuid [pk]
+  phone varchar(20) [not null]
+  purpose otp_purpose [not null]
+  code_hash varchar(64) [not null]
+  expires_at timestamptz [not null]
+  attempt_count smallint [not null, default: 0]
+  consumed_at timestamptz
+  created_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (phone, purpose)
+    created_at
+  }
+}
+
+Table password_reset_token {
+  id uuid [pk]
+  user_id uuid [not null]
+  token_hash varchar(64) [not null, unique]
+  expires_at timestamptz [not null]
+  consumed_at timestamptz
+  created_at timestamptz [not null, default: `now()`]
+
+  Note: 'Scoped to password reset only. Cannot be used as an access token.'
+}
+
+Table device {
+  id uuid [pk]
+  user_id uuid [not null]
+  fcm_token varchar(255) [not null, unique]
+  platform platform [not null]
+  created_at timestamptz [not null, default: `now()`]
+  last_seen_at timestamptz
+
+  indexes {
+    user_id
+  }
+
+  Note: 'Deleted on logout, so the next user of a shared phone does not receive the previous users booking notifications.'
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════
+// SHOP
+// ═════════════════════════════════════════════════════════════════════════
+
+Table shop {
+  id uuid [pk]
+  owner_id uuid [not null]
+  name varchar(150) [not null]
+  description text
+  phone varchar(20) [not null]
+  email varchar(255)
+  address text [not null]
+  latitude decimal(9,6) [not null]
+  longitude decimal(9,6) [not null]
+  status shop_status [not null, default: 'PENDING_VERIFICATION']
+  verified_at timestamptz
+  verification_note text
+  suspension_reason text
+  offers_delivery boolean [not null, default: false]
+  delivery_fee decimal(10,2)
+  accepts_pay_at_shop boolean [not null, default: true]
+  cancellation_policy text
+  rating decimal(2,1)
+  review_count integer [not null, default: 0]
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    owner_id
+    status
+    (latitude, longitude)
+  }
+
+  Note: 'Only a VERIFIED shop appears in search or can receive a booking (FR-77).'
+}
+
+Table shop_opening_hours {
+  id uuid [pk]
+  shop_id uuid [not null]
+  day_of_week smallint [not null]
+  opens_at time
+  closes_at time
+  closed boolean [not null, default: false]
+
+  indexes {
+    (shop_id, day_of_week) [unique]
+  }
+}
+
+Table shop_rental_requirement {
+  id uuid [pk]
+  shop_id uuid [not null]
+  requirement varchar(300) [not null]
+  sort_order smallint [not null, default: 0]
+
+  indexes { shop_id }
+}
+
+Table shop_photo {
+  id uuid [pk]
+  shop_id uuid [not null]
+  url varchar(500) [not null]
+  thumbnail_url varchar(500)
+  sort_order smallint [not null, default: 0]
+  uploaded_at timestamptz [not null, default: `now()`]
+
+  indexes { shop_id }
+}
+
+Table shop_member {
+  id uuid [pk]
+  shop_id uuid [not null]
+  user_id uuid [not null]
+  role shop_member_role [not null]
+  status shop_member_status [not null, default: 'INVITED']
+  invited_at timestamptz [not null, default: `now()`]
+  joined_at timestamptz
+
+  indexes {
+    (shop_id, user_id) [unique]
+    user_id
+  }
+
+  Note: 'Staff may confirm, reject, hand over and return.'
+}
+
+Table payout_account {
+  id uuid [pk]
+  shop_id uuid [not null, unique]
+  bank bank [not null]
+  account_holder_name varchar(150) [not null]
+  last4 char(4) [not null]
+  beneficiary_reference varchar(255) [not null]
+  verified boolean [not null, default: false]
+  registered_at timestamptz [not null, default: `now()`]
+
+  Note: 'THE FULL ACCOUNT NUMBER IS NOT STORED.'
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════
+// FLEET
+// ═════════════════════════════════════════════════════════════════════════
+
+Table motorbike {
+  id uuid [pk]
+  shop_id uuid [not null]
+  brand varchar(60) [not null]
+  model varchar(120) [not null]
+  type motorbike_type [not null]
+  transmission transmission
+  engine_cc smallint
+  year smallint
+  color varchar(40)
+  plate_number varchar(20) [not null]
+  price_per_day decimal(10,2) [not null]
+  currency char(3) [not null, default: 'USD']
+  status motorbike_status [not null, default: 'ACTIVE']
+  description text
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (shop_id, plate_number) [unique, name: 'uq_motorbike_shop_plate']
+    (shop_id, model) [name: 'ix_motorbike_shop_model']
+    (shop_id, status)
+  }
+
+  Note: 'ONE ROW PER PHYSICAL BIKE.'
+}
+
+Table motorbike_photo {
+  id uuid [pk]
+  motorbike_id uuid [not null]
+  url varchar(500) [not null]
+  thumbnail_url varchar(500)
+  is_primary boolean [not null, default: false]
+  sort_order smallint [not null, default: 0]
+  uploaded_at timestamptz [not null, default: `now()`]
+
+  indexes { motorbike_id }
+}
+
+Table motorbike_feature {
+  id uuid [pk]
+  motorbike_id uuid [not null]
+  feature varchar(100) [not null]
+
+  indexes { motorbike_id }
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════
+// BOOKING — the heart of the system
+// ═════════════════════════════════════════════════════════════════════════
+
+Table booking {
+  id uuid [pk]
+  reference varchar(20) [not null, unique]
+  customer_id uuid [not null]
+  shop_id uuid [not null]
+  status booking_status [not null, default: 'PENDING']
+
+  start_date date [not null]
+  end_date date [not null]
+
+  assigned_motorbike_id uuid [not null]
+  period daterange [not null]
+
+  pickup_method pickup_method [not null]
+  delivery_address text
+  delivery_latitude decimal(9,6)
+  delivery_longitude decimal(9,6)
+
+  payment_option payment_option [not null]
+  payment_status payment_status [not null, default: 'UNPAID']
+  payout_status payout_status [not null, default: 'NOT_DUE']
+
+  subtotal decimal(10,2) [not null]
+  delivery_fee decimal(10,2) [not null, default: 0]
+  total decimal(10,2) [not null]
+  currency char(3) [not null, default: 'USD']
+
+  commission_rate decimal(5,4) [not null]
+  platform_fee decimal(10,2) [not null]
+  shop_payout decimal(10,2) [not null]
+
+  late_fee decimal(10,2) [not null, default: 0]
+  damage_fee decimal(10,2) [not null, default: 0]
+  refund_amount decimal(10,2) [not null, default: 0]
+
+  hold_expires_at timestamptz
+  confirmed_at timestamptz
+  activated_at timestamptz
+  completed_at timestamptz
+
+  cancellation_reason text
+  rejection_reason rejection_reason
+  rejection_note text
+  customer_note varchar(500)
+
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (customer_id, status)
+    (shop_id, status)
+    (shop_id, start_date)
+    (shop_id, end_date)
+    (status, hold_expires_at) [name: 'ix_booking_hold_sweep']
+    (assigned_motorbike_id, status) [name: 'ix_booking_unit_status']
+    (status, start_date, end_date) [name: 'ix_booking_availability']
+  }
+
+  Note: 'Only PENDING, CONFIRMED and ACTIVE block availability.'
+}
+
+Table booking_item {
+  id uuid [pk]
+  booking_id uuid [not null]
+
+  // ── THE SNAPSHOT ──
+  brand varchar(60) [not null]
+  model varchar(120) [not null]
+  price_per_day decimal(10,2) [not null]
+  rental_days smallint [not null]
+  subtotal decimal(10,2) [not null]
+  delivery_fee decimal(10,2) [not null, default: 0]
+
+  assigned_plate_number varchar(20) [not null]
+  actual_motorbike_id uuid
+  actual_plate_number varchar(20)
+
+  indexes {
+    booking_id
+    actual_motorbike_id
+  }
+
+  Note: 'THE SNAPSHOT TABLE.'
+}
+
+Table booking_extension {
+  id uuid [pk]
+  booking_id uuid [not null]
+  previous_end_date date [not null]
+  new_end_date date [not null]
+  extra_days smallint [not null]
+  price_per_day decimal(10,2) [not null]
+  extra_amount decimal(10,2) [not null]
+  platform_fee decimal(10,2) [not null]
+  shop_payout decimal(10,2) [not null]
+  created_at timestamptz [not null, default: `now()`]
+
+  indexes { booking_id }
+
+  Note: 'An extension is a SEPARATE payment and a separate payout, not an edit of the original.'
+}
+
+Table condition_record {
+  id uuid [pk]
+  booking_id uuid [not null]
+  kind condition_kind [not null]
+  recorded_by uuid [not null]
+  odometer_reading integer
+  fuel_level fuel_level
+  note text
+  cash_collected decimal(10,2)
+  recorded_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (booking_id, kind) [unique]
+  }
+
+  Note: 'The shops only evidence in a damage dispute. Photos in condition_photo.'
+}
+
+Table condition_photo {
+  id uuid [pk]
+  condition_record_id uuid [not null]
+  url varchar(500) [not null]
+  uploaded_at timestamptz [not null, default: `now()`]
+
+  indexes { condition_record_id }
+
+  Note: 'Stored in S3, not on the container filesystem — a redeploy would delete the evidence.'
+}
+
+Table idempotency_key {
+  id uuid [pk]
+  key uuid [not null, unique]
+  user_id uuid [not null]
+  endpoint varchar(120) [not null]
+  booking_id uuid
+  response_status smallint
+  created_at timestamptz [not null, default: `now()`]
+
+  Note: 'Required on POST /bookings and POST /bookings/{id}/extend.'
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════
+// MONEY
+// ═════════════════════════════════════════════════════════════════════════
+
+Table payment {
+  id uuid [pk]
+  booking_id uuid [not null]
+  extension_id uuid
+  kind payment_kind [not null, default: 'BOOKING']
+  amount decimal(10,2) [not null]
+  currency char(3) [not null, default: 'USD']
+  method payment_method [not null]
+  status payment_status [not null, default: 'PENDING']
+  transaction_id varchar(120) [unique]
+  qr_payload text
+  expires_at timestamptz
+  paid_at timestamptz
+  failure_reason text
+  created_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    booking_id
+    status
+  }
+
+  Note: 'A payment becomes PAID only when the providers SIGNED callback arrives.'
+}
+
+Table payment_callback_log {
+  id uuid [pk]
+  transaction_id varchar(120) [not null]
+  signature_valid boolean [not null]
+  raw_payload jsonb [not null]
+  outcome varchar(60) [not null]
+  received_at timestamptz [not null, default: `now()`]
+
+  indexes { transaction_id }
+
+  Note: 'Every callback is logged BEFORE it is acted on, valid or not.'
+}
+
+Table payout {
+  id uuid [pk]
+  booking_id uuid [not null]
+  extension_id uuid
+  payout_account_id uuid [not null]
+  gross_amount decimal(10,2) [not null]
+  platform_fee decimal(10,2) [not null]
+  amount decimal(10,2) [not null]
+  currency char(3) [not null, default: 'USD']
+  status payout_status [not null, default: 'PENDING']
+  attempt_count smallint [not null, default: 0]
+  failure_reason text
+  provider_reference varchar(120)
+  sent_at timestamptz
+  created_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    booking_id
+    status
+  }
+
+  Note: 'Created at HANDOVER, not at payment.'
+}
+
+Table refund {
+  id uuid [pk]
+  booking_id uuid [not null]
+  payment_id uuid [not null]
+  amount decimal(10,2) [not null]
+  reason text [not null]
+  issued_by uuid
+  provider_reference varchar(120)
+  status varchar(20) [not null]
+  created_at timestamptz [not null, default: `now()`]
+
+  indexes { booking_id }
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════
+// AFTER THE RENTAL
+// ═════════════════════════════════════════════════════════════════════════
+
+Table review {
+  id uuid [pk]
+  booking_id uuid [not null, unique]
+  customer_id uuid [not null]
+  shop_id uuid [not null]
+  model varchar(120) [not null]
+  rating smallint [not null]
+  comment text
+  shop_reply text
+  shop_replied_at timestamptz
+  deleted_at timestamptz
+  deleted_reason text
+  created_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (shop_id, deleted_at)
+    customer_id
+  }
+
+  Note: 'Only creatable when the booking is COMPLETED (FR-48). One reply per review, no threading — a review page is not a place for an argument.'
+}
+
+Table assistance_request {
+  id uuid [pk]
+  booking_id uuid [not null]
+  problem_type assistance_problem [not null]
+  description text
+  latitude decimal(9,6) [not null]
+  longitude decimal(9,6) [not null]
+  status assistance_status [not null, default: 'OPEN']
+  resolution_note text
+  replacement_motorbike_id uuid
+  created_at timestamptz [not null, default: `now()`]
+  resolved_at timestamptz
+
+  indexes {
+    booking_id
+    status
+  }
+
+  Note: 'Valid only while the booking is ACTIVE.'
+}
+
+Table notification {
+  id uuid [pk]
+  user_id uuid [not null]
+  type notification_type [not null]
+  title varchar(200) [not null]
+  body text
+  booking_id uuid
+  read boolean [not null, default: false]
+  created_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (user_id, read, created_at) [name: 'ix_notification_inbox']
+  }
+
+  Note: 'The durable record. FCM push is separate and best-effort — a phone can be offline or have permission denied.'
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════
+// EXPLORE SIEM REAP  (later slice)
+// ═════════════════════════════════════════════════════════════════════════
+
+Table place {
+  id uuid [pk]
+  name varchar(150) [not null]
+  category place_category [not null]
+  description text
+  address text
+  latitude decimal(9,6) [not null]
+  longitude decimal(9,6) [not null]
+  entrance_fee varchar(120)
+  opening_hours varchar(120)
+  estimated_ride_minutes smallint
+  featured boolean [not null, default: false]
+  visible boolean [not null, default: false]
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (category, visible)
+    (latitude, longitude)
+  }
+}
+
+Table place_photo {
+  id uuid [pk]
+  place_id uuid [not null]
+  url varchar(500) [not null]
+  sort_order smallint [not null, default: 0]
+
+  indexes { place_id }
+}
+
+Table place_tip {
+  id uuid [pk]
+  place_id uuid [not null]
+  tip varchar(300) [not null]
+  sort_order smallint [not null, default: 0]
+
+  indexes { place_id }
+}
+
+Table blog_post {
+  id uuid [pk]
+  slug varchar(160) [not null, unique]
+  title varchar(200) [not null]
+  excerpt varchar(400)
+  body text
+  cover_image_url varchar(500)
+  status blog_status [not null, default: 'DRAFT']
+  author_id uuid
+  read_minutes smallint
+  published_at timestamptz
+  created_at timestamptz [not null, default: `now()`]
+  updated_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (status, published_at)
+  }
+}
+
+Table blog_post_tag {
+  id uuid [pk]
+  blog_post_id uuid [not null]
+  tag varchar(60) [not null]
+
+  indexes {
+    (blog_post_id, tag) [unique]
+    tag
+  }
+}
+
+Table blog_post_place {
+  blog_post_id uuid [not null]
+  place_id uuid [not null]
+  sort_order smallint [not null, default: 0]
+
+  indexes {
+    (blog_post_id, place_id) [pk]
+  }
+
+  Note: 'An article shows its places on a map instead of repeating the details in prose.'
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════
+// AUDIT
+// ═════════════════════════════════════════════════════════════════════════
+
+Table audit_log {
+  id bigserial [pk]
+  actor_id uuid
+  action varchar(80) [not null]
+  entity_type varchar(40) [not null]
+  entity_id varchar(64) [not null]
+  before jsonb
+  after jsonb
+  ip_address inet
+  created_at timestamptz [not null, default: `now()`]
+
+  indexes {
+    (entity_type, entity_id)
+    actor_id
+    created_at
+  }
+
+  Note: 'Append-only.'
+}
+
+
+// ═════════════════════════════════════════════════════════════════════════
+// RELATIONSHIPS
+// ═════════════════════════════════════════════════════════════════════════
+
+Ref: auth_identity.user_id > users.id [delete: cascade]
+Ref: user_role.user_id > users.id [delete: cascade]
+Ref: refresh_token.user_id > users.id [delete: cascade]
+Ref: password_reset_token.user_id > users.id [delete: cascade]
+Ref: device.user_id > users.id [delete: cascade]
+
+Ref: shop.owner_id > users.id [delete: restrict]
+Ref: shop_opening_hours.shop_id > shop.id [delete: cascade]
+Ref: shop_rental_requirement.shop_id > shop.id [delete: cascade]
+Ref: shop_photo.shop_id > shop.id [delete: cascade]
+Ref: shop_member.shop_id > shop.id [delete: cascade]
+Ref: shop_member.user_id > users.id [delete: cascade]
+Ref: payout_account.shop_id - shop.id [delete: restrict]
+
+Ref: motorbike.shop_id > shop.id [delete: restrict]
+Ref: motorbike_photo.motorbike_id > motorbike.id [delete: cascade]
+Ref: motorbike_feature.motorbike_id > motorbike.id [delete: cascade]
+
+Ref: booking.customer_id > users.id [delete: restrict]
+Ref: booking.shop_id > shop.id [delete: restrict]
+Ref: booking_item.booking_id - booking.id [delete: cascade]
+Ref: booking.assigned_motorbike_id > motorbike.id [delete: restrict]
+Ref: booking_item.actual_motorbike_id > motorbike.id [delete: restrict]
+Ref: booking_extension.booking_id > booking.id [delete: cascade]
+Ref: condition_record.booking_id > booking.id [delete: cascade]
+Ref: condition_record.recorded_by > users.id [delete: restrict]
+Ref: condition_photo.condition_record_id > condition_record.id [delete: cascade]
+Ref: idempotency_key.user_id > users.id [delete: cascade]
+Ref: idempotency_key.booking_id > booking.id [delete: set null]
+
+Ref: payment.booking_id > booking.id [delete: restrict]
+Ref: payment.extension_id > booking_extension.id [delete: set null]
+Ref: payout.booking_id > booking.id [delete: restrict]
+Ref: payout.extension_id > booking_extension.id [delete: set null]
+Ref: payout.payout_account_id > payout_account.id [delete: restrict]
+Ref: refund.booking_id > booking.id [delete: restrict]
+Ref: refund.payment_id > payment.id [delete: restrict]
+Ref: refund.issued_by > users.id [delete: set null]
+
+Ref: review.booking_id - booking.id [delete: restrict]
+Ref: review.customer_id > users.id [delete: restrict]
+Ref: review.shop_id > shop.id [delete: cascade]
+
+Ref: assistance_request.booking_id > booking.id [delete: cascade]
+Ref: assistance_request.replacement_motorbike_id > motorbike.id [delete: set null]
+
+Ref: notification.user_id > users.id [delete: cascade]
+Ref: notification.booking_id > booking.id [delete: cascade]
+
+Ref: place_photo.place_id > place.id [delete: cascade]
+Ref: place_tip.place_id > place.id [delete: cascade]
+Ref: blog_post.author_id > users.id [delete: set null]
+Ref: blog_post_tag.blog_post_id > blog_post.id [delete: cascade]
+Ref: blog_post_place.blog_post_id > blog_post.id [delete: cascade]
+Ref: blog_post_place.place_id > place.id [delete: cascade]
+
+Ref: audit_log.actor_id > users.id [delete: set null]
+
+
+// ═════════════════════════════════════════════════════════════════════════
+// TABLE GROUPS — dbdiagram lays these out as coloured clusters
+// ═════════════════════════════════════════════════════════════════════════
+
+TableGroup identity [color: #6366f1] {
+  users
+  auth_identity
+  user_role
+  refresh_token
+  otp_code
+  password_reset_token
+  device
+}
+
+TableGroup shop_domain [color: #0F9D8A] {
+  shop
+  shop_opening_hours
+  shop_rental_requirement
+  shop_photo
+  shop_member
+  payout_account
+}
+
+TableGroup fleet [color: #14b8a6] {
+  motorbike
+  motorbike_photo
+  motorbike_feature
+}
+
+TableGroup booking_domain [color: #f59e0b] {
+  booking
+  booking_item
+  booking_extension
+  condition_record
+  condition_photo
+  idempotency_key
+}
+
+TableGroup money [color: #ef4444] {
+  payment
+  payment_callback_log
+  payout
+  refund
+}
+
+TableGroup engagement [color: #8b5cf6] {
+  review
+  assistance_request
+  notification
+}
+
+TableGroup explore [color: #64748b] {
+  place
+  place_photo
+  place_tip
+  blog_post
+  blog_post_tag
+  blog_post_place
+}
+
+TableGroup ops [color: #475569] {
+  audit_log
+}

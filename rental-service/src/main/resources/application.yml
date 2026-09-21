@@ -1,0 +1,73 @@
+# rental-service/src/main/resources/application.yml
+#
+# Delete the generated application.properties — Spring reads both, and having
+# two config files disagreeing is a bad hour to spend.
+
+server:
+  port: ${SERVER_PORT:8082}
+
+spring:
+  application:
+    name: rental-service
+
+  datasource:
+    # Defaults point at localhost so you can run from IntelliJ or ./mvnw.
+    # docker-compose overrides them with host "db".
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5433/sabayride?currentSchema=rental}
+    username: ${SPRING_DATASOURCE_USERNAME:rental_user}
+    password: ${SPRING_DATASOURCE_PASSWORD:devpassword}
+    hikari:
+      # Small on purpose. Every connection is memory on a 2 GB box, and a
+      # pool larger than the database can serve just moves the queue.
+      maximum-pool-size: 10
+      # Fail fast rather than hanging a request for 30s on a dead database.
+      connection-timeout: 5000
+
+  flyway:
+    enabled: true
+    # Where flyway_schema_history lives, and where migrations run.
+    schemas: rental
+    default-schema: rental
+    locations: classpath:db/migration
+    # The schema is created by infra/db/init-schemas.sql, not by Flyway.
+    create-schemas: false
+
+  jpa:
+    hibernate:
+      # VALIDATE, never UPDATE. Flyway owns the schema; Hibernate only checks
+      # that the entities match what Flyway built. `update` would let Hibernate
+      # silently alter your tables, and then the migration files stop describing
+      # what is actually in the database — which is the point at which nobody
+      # can safely deploy anything.
+      ddl-auto: validate
+    open-in-view: false   # avoid holding a DB connection for the whole request
+    properties:
+      hibernate:
+        default_schema: rental
+        jdbc:
+          time_zone: UTC
+
+  jackson:
+    default-property-inclusion: non_null
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: when_authorized
+
+logging:
+  level:
+    org.flywaydb: INFO
+    # Uncomment when debugging the availability query:
+    # org.hibernate.SQL: DEBUG
+    # org.springframework.jdbc.core: TRACE
+
+sabayride:
+  commission-rate: 0.10
+  hold:
+    same-day-minutes: 30
+    future-hours: 2

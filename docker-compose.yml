@@ -1,0 +1,165 @@
+# SabayRide — microservices local stack
+#
+#   docker compose up -d
+#   docker compose logs -f rental-service
+#   docker compose down -v
+#
+# ONE PostgreSQL instance, FOUR schemas. Each service owns its schema and may
+# not read another's — enforced by giving each service a database user with
+# rights to one schema only, so a cross-schema query fails with a permission
+# error instead of quietly working and becoming load-bearing.
+#
+# Four Postgres containers would be more "correct" and would cost ~800 MB of RAM
+# to prove a point. One instance, four schemas, four users is the version that
+# fits on a machine you can afford.
+
+services:
+
+  # ─── data ──────────────────────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    container_name: sabayride-db
+    environment:
+      POSTGRES_DB: sabayride
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: devpassword
+    ports: ["5433:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # creates the four schemas and their owners on first boot
+      - ./infra/db/init-schemas.sql:/docker-entrypoint-initdb.d/01-schemas.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits: { memory: 384M }
+
+  # ─── gateway: the only thing exposed to the outside ────────────────────
+  gateway:
+    build: ./gateway
+    container_name: sabayride-gateway
+    depends_on:
+      identity-service: { condition: service_healthy }
+    environment:
+      SPRING_PROFILES_ACTIVE: dev
+      JWT_PUBLIC_KEY_URL: http://identity-service:8081/.well-known/jwks.json
+      ROUTE_IDENTITY: http://identity-service:8081
+      ROUTE_RENTAL:   http://rental-service:8082
+      ROUTE_PAYMENT:  http://payment-service:8083
+      ROUTE_CONTENT:  http://content-service:8084
+      JAVA_OPTS: "-XX:MaxRAMPercentage=70 -XX:+UseSerialGC"
+    ports: ["8080:8080"]
+    deploy:
+      resources:
+        limits: { memory: 320M }
+
+  # ─── identity: users, auth, OTP, tokens ────────────────────────────────
+  identity-service:
+    build: ./identity-service
+    container_name: sabayride-identity
+    depends_on:
+      db: { condition: service_healthy }
+    environment:
+      SPRING_PROFILES_ACTIVE: dev
+      SPRING_DATASOURCE_URL: jdbc:postgresql://db:5432/sabayride?currentSchema=identity
+      SPRING_DATASOURCE_USERNAME: identity_user
+      SPRING_DATASOURCE_PASSWORD: devpassword
+      # Only this service holds the PRIVATE key. Everyone else gets the public
+      # key from /.well-known/jwks.json, so no other service can mint a token.
+      JWT_PRIVATE_KEY_PATH: /run/secrets/jwt-private.pem
+      SABAYRIDE_OTP_DELIVERY: LOG
+      JAVA_OPTS: "-XX:MaxRAMPercentage=70 -XX:+UseSerialGC"
+    volumes:
+      - ./infra/keys:/run/secrets:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8081/actuator/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 45s
+    deploy:
+      resources:
+        limits: { memory: 384M }
+
+  # ─── rental: shops, fleet, bookings — THE CORE ─────────────────────────
+  # motorbike and booking live together on purpose. The availability lock and
+  # the EXCLUDE constraint both require them in one database and one
+  # transaction. Splitting them is the one thing this architecture may not do.
+  rental-service:
+    build: ./rental-service
+    container_name: sabayride-rental
+    depends_on:
+      db: { condition: service_healthy }
+    environment:
+      SPRING_PROFILES_ACTIVE: dev
+      SPRING_DATASOURCE_URL: jdbc:postgresql://db:5432/sabayride?currentSchema=rental
+      SPRING_DATASOURCE_USERNAME: rental_user
+      SPRING_DATASOURCE_PASSWORD: devpassword
+      JWKS_URL: http://identity-service:8081/.well-known/jwks.json
+      PAYMENT_SERVICE_URL: http://payment-service:8083
+      JAVA_OPTS: "-XX:MaxRAMPercentage=70 -XX:+UseSerialGC"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8082/actuator/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 45s
+    deploy:
+      resources:
+        limits: { memory: 448M }
+
+  # ─── payment: PayWay, payouts, refunds ─────────────────────────────────
+  payment-service:
+    build: ./payment-service
+    container_name: sabayride-payment
+    depends_on:
+      db: { condition: service_healthy }
+    environment:
+      SPRING_PROFILES_ACTIVE: dev
+      SPRING_DATASOURCE_URL: jdbc:postgresql://db:5432/sabayride?currentSchema=payment
+      SPRING_DATASOURCE_USERNAME: payment_user
+      SPRING_DATASOURCE_PASSWORD: devpassword
+      JWKS_URL: http://identity-service:8081/.well-known/jwks.json
+      RENTAL_SERVICE_URL: http://rental-service:8082
+      PAYWAY_MERCHANT_ID: ${PAYWAY_MERCHANT_ID}
+      PAYWAY_API_KEY: ${PAYWAY_API_KEY}
+      JAVA_OPTS: "-XX:MaxRAMPercentage=70 -XX:+UseSerialGC"
+    deploy:
+      resources:
+        limits: { memory: 384M }
+
+  # ─── content: Explore Siem Reap ────────────────────────────────────────
+  # The genuinely independent service: read-heavy, cacheable, shares no
+  # transaction with anything. If one service here deserves to be separate,
+  # it is this one.
+  content-service:
+    build: ./content-service
+    container_name: sabayride-content
+    depends_on:
+      db: { condition: service_healthy }
+    environment:
+      SPRING_PROFILES_ACTIVE: dev
+      SPRING_DATASOURCE_URL: jdbc:postgresql://db:5432/sabayride?currentSchema=content
+      SPRING_DATASOURCE_USERNAME: content_user
+      SPRING_DATASOURCE_PASSWORD: devpassword
+      JWKS_URL: http://identity-service:8081/.well-known/jwks.json
+      JAVA_OPTS: "-XX:MaxRAMPercentage=70 -XX:+UseSerialGC"
+    deploy:
+      resources:
+        limits: { memory: 320M }
+
+volumes:
+  pgdata:
+
+# ─── RAM budget ──────────────────────────────────────────────────────────
+#   db 384 + gateway 320 + identity 384 + rental 448 + payment 384
+#   + content 320  =  ~2.25 GB, before the OS and before Grafana.
+#
+#   A t3.micro is 1 GB. This does not fit and cannot be made to fit.
+#   Plan on t3.small (2 GB) at minimum and realistically t3.medium (4 GB)
+#   once Prometheus, Loki and Grafana are added. That is outside the free
+#   tier — roughly $15–30/month. It is the direct, unavoidable cost of the
+#   architecture, and it is better known now than on the day the bill lands.
